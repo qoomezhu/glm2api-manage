@@ -6,25 +6,33 @@ import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
+from .tool_protocol import BLOCKED_NATIVE_TOOL_NAMES
 
 CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
-TOOL_RESULT_PATTERN = re.compile(r"<(?:ml_)?tool_result\b[\s\S]*?</(?:ml_)?tool_result>", re.IGNORECASE)
-START_TAG_PATTERN = re.compile(r"<(?P<tag>(?:ml_)?tool_calls|(?:ml_)?tool_call)\b[^>]*>", re.IGNORECASE)
+TOOL_RESULT_PATTERN = re.compile(
+    r"<(?:(?:\|DSML\|)|ml_)?tool_result\b[\s\S]*?</(?:(?:\|DSML\|)|ml_)?tool_result>",
+    re.IGNORECASE,
+)
+START_TAG_PATTERN = re.compile(
+    r"<(?P<tag>\|DSML\|tool_calls|tool_calls|ml_tool_calls|ml_tool_call)\b[^>]*>",
+    re.IGNORECASE,
+)
+DSML_TAG_PATTERN = re.compile(r"</?\|DSML\|(?P<name>tool_calls|invoke|parameter|tool_result)\b", re.IGNORECASE)
 PARAM_NAME_TAG_PATTERN = re.compile(r"<param_name>\s*(.*?)\s*</param_name>", re.IGNORECASE | re.DOTALL)
 PARAM_VALUE_TAG_PATTERN = re.compile(r"<param_value>\s*(.*?)\s*</param_value>", re.IGNORECASE | re.DOTALL)
-TOOL_CHATTER_PATTERN = re.compile(
-    r"(?is)"
-    r"(?:the\s+open_url\s+tool\s+is\s+not\s+available.*?|"
-    r"let\s+me\s+use\s+the\s+correct.*?|"
-    r"i\s+apologize\s+for\s+the\s+repeated.*?|"
-    r"the\s+tool\s+open_url\s+appears\s+to\s+be\s+blocked.*?|"
-    r"open_url工具被阻止.*?|"
-    r"让我改用.*?工具.*?|"
-    r"非常抱歉.*?|"
-    r"我无法继续尝试.*?|"
-    r"总结问题[:：].*?)(?=<(?:ml_)?tool_calls\b|$)"
-)
 TAG_NAME_HINTS = [
+    "<|",
+    "</|",
+    "<|DSML|",
+    "</|DSML|",
+    "<|DSML|tool_calls",
+    "</|DSML|tool_calls",
+    "<|DSML|invoke",
+    "</|DSML|invoke",
+    "<|DSML|parameter",
+    "</|DSML|parameter",
+    "<|DSML|tool_result",
+    "</|DSML|tool_result",
     "<m",
     "</m",
     "<ml_",
@@ -41,6 +49,10 @@ TAG_NAME_HINTS = [
     "</ml_tool_result",
     "<tool_calls",
     "</tool_calls",
+    "<invoke",
+    "</invoke",
+    "<parameter",
+    "</parameter",
 ]
 
 
@@ -50,6 +62,16 @@ def _local_name(tag: str) -> str:
     if ":" in tag:
         tag = tag.split(":", 1)[1]
     return tag.lower()
+
+
+def _normalize_dsml_to_xml(block: str) -> str:
+    return DSML_TAG_PATTERN.sub(lambda match: match.group(0).replace("|DSML|", ""), block)
+
+
+def _is_allowed_tool_name(tool_name: str, allowed_tool_names: set[str] | None) -> bool:
+    if tool_name in BLOCKED_NATIVE_TOOL_NAMES:
+        return False
+    return allowed_tool_names is None or tool_name in allowed_tool_names
 
 
 def _balanced_text(value: str) -> str:
@@ -114,6 +136,8 @@ def _xml_value_to_object(element: ET.Element) -> object:
 
 
 def _extract_tool_name(element: ET.Element) -> str:
+    if _local_name(element.tag) == "invoke":
+        return element.attrib.get("name", "").strip()
     for tag_name in ("ml_tool_name", "tool_name"):
         tool_name_element = element.find(tag_name)
         if tool_name_element is not None:
@@ -122,6 +146,19 @@ def _extract_tool_name(element: ET.Element) -> str:
 
 
 def _extract_arguments(element: ET.Element) -> dict[str, object] | None:
+    if _local_name(element.tag) == "invoke":
+        parameters: dict[str, object] = {}
+        parameter_children = [
+            child
+            for child in list(element)
+            if isinstance(child.tag, str) and _local_name(child.tag) == "parameter"
+        ]
+        for child in parameter_children:
+            key = child.attrib.get("name", "").strip()
+            if key:
+                _append_value(parameters, key, _xml_value_to_object(child))
+        return parameters
+
     for tag_name in ("ml_parameters", "parameters"):
         parameters_element = element.find(tag_name)
         if parameters_element is not None:
@@ -149,13 +186,13 @@ def _parse_tool_call_element(
     allowed_tool_names: set[str] | None,
     index: int,
 ) -> dict[str, object] | None:
-    if _local_name(element.tag) not in {"tool_call", "ml_tool_call"}:
+    if _local_name(element.tag) not in {"invoke", "tool_call", "ml_tool_call"}:
         return None
 
     tool_name = _extract_tool_name(element)
     if not tool_name:
         return None
-    if allowed_tool_names is not None and tool_name not in allowed_tool_names:
+    if not _is_allowed_tool_name(tool_name, allowed_tool_names):
         return None
 
     arguments = _extract_arguments(element)
@@ -177,7 +214,7 @@ def _extract_malformed_tool_call_from_root(
     tool_name = _extract_tool_name(root)
     if not tool_name:
         return None
-    if allowed_tool_names is not None and tool_name not in allowed_tool_names:
+    if not _is_allowed_tool_name(tool_name, allowed_tool_names):
         return None
 
     for tag_name in ("ml_parameters", "parameters"):
@@ -219,13 +256,17 @@ def _parse_xml_block(
     start_index: int,
 ) -> tuple[list[dict[str, object]], tuple[int, int] | None]:
     try:
-        root = ET.fromstring(block)
+        root = ET.fromstring(_normalize_dsml_to_xml(block))
     except ET.ParseError:
         return [], None
 
     root_name = _local_name(root.tag)
     if root_name in {"tool_calls", "ml_tool_calls"}:
-        candidates = [child for child in list(root) if isinstance(child.tag, str)]
+        candidates = [
+            child
+            for child in list(root)
+            if isinstance(child.tag, str) and _local_name(child.tag) in {"invoke", "tool_call", "ml_tool_call"}
+        ]
     elif root_name in {"tool_call", "ml_tool_call"}:
         candidates = [root]
     else:
@@ -287,7 +328,7 @@ def _extract_tool_blocks(text: str, allowed_tool_names: set[str] | None) -> tupl
             tool_calls.extend(block_calls)
             cursor = end
             continue
-        if match.group("tag").lower().startswith("ml_"):
+        if match.group("tag").lower() in {"|dsml|tool_calls", "tool_calls", "ml_tool_calls", "ml_tool_call"}:
             spans.append((start, end))
             cursor = end
             continue
@@ -300,7 +341,6 @@ def _extract_tool_blocks(text: str, allowed_tool_names: set[str] | None) -> tupl
 def _remove_spans(text: str, spans: list[tuple[int, int]], *, trim_outer_whitespace: bool = True) -> str:
     if not spans:
         cleaned = TOOL_RESULT_PATTERN.sub("", text)
-        cleaned = TOOL_CHATTER_PATTERN.sub("", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip() if trim_outer_whitespace else cleaned
 
@@ -314,7 +354,6 @@ def _remove_spans(text: str, spans: list[tuple[int, int]], *, trim_outer_whitesp
     parts.append(text[cursor:])
     cleaned = "".join(parts)
     cleaned = TOOL_RESULT_PATTERN.sub("", cleaned)
-    cleaned = TOOL_CHATTER_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip() if trim_outer_whitespace else cleaned
 
@@ -361,9 +400,15 @@ def _looks_like_tool_markup_fragment(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
+    if stripped.startswith("<|DSML|") or stripped.startswith("</|DSML|"):
+        return True
     if stripped.startswith("<ml_") or stripped.startswith("</ml_"):
         return True
     if stripped.startswith("<tool_") or stripped.startswith("</tool_"):
+        return True
+    if stripped.startswith("<invoke") or stripped.startswith("</invoke"):
+        return True
+    if stripped.startswith("<parameter") or stripped.startswith("</parameter"):
         return True
     if stripped.startswith("<m") and any(token in stripped for token in ("ml_", "tool_", "tool_calls", "tool_result")):
         return True

@@ -1,6 +1,99 @@
 from glm2api.utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
 
 
+def test_parse_tool_calls_from_dsml_markup():
+    text = (
+        "before\n"
+        "<|DSML|tool_calls><|DSML|invoke name=\"get_weather\">"
+        "<|DSML|parameter name=\"city\"><![CDATA[上海]]></|DSML|parameter>"
+        "<|DSML|parameter name=\"days\">2</|DSML|parameter>"
+        "</|DSML|invoke></|DSML|tool_calls>\n"
+        "after"
+    )
+
+    clean, tool_calls = parse_tool_calls_from_text(text, {"get_weather"})
+
+    assert clean == "before\n\nafter"
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "get_weather"
+    assert tool_calls[0]["function"]["arguments"] == '{"city":"上海","days":2}'
+
+
+def test_parse_tool_calls_from_canonical_invoke_markup():
+    text = (
+        "<tool_calls><invoke name=\"search_web\">"
+        "<parameter name=\"query\"><![CDATA[glm2api]]></parameter>"
+        "<parameter name=\"filters\"><parameter name=\"site\">example.com</parameter></parameter>"
+        "<parameter name=\"tags\"><item>python</item><item>xml</item></parameter>"
+        "</invoke></tool_calls>"
+    )
+
+    clean, tool_calls = parse_tool_calls_from_text(text, {"search_web"})
+
+    assert clean == ""
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["arguments"] == (
+        '{"query":"glm2api","filters":{"site":"example.com"},"tags":["python","xml"]}'
+    )
+
+
+def test_parse_rejects_undeclared_and_blocked_native_tools():
+    blocked_text = (
+        "<|DSML|tool_calls><|DSML|invoke name=\"open_url\">"
+        "<|DSML|parameter name=\"url\">https://example.com</|DSML|parameter>"
+        "</|DSML|invoke></|DSML|tool_calls>"
+    )
+    undeclared_text = (
+        "<|DSML|tool_calls><|DSML|invoke name=\"not_declared\">"
+        "<|DSML|parameter name=\"value\">x</|DSML|parameter>"
+        "</|DSML|invoke></|DSML|tool_calls>"
+    )
+
+    clean, tool_calls = parse_tool_calls_from_text(blocked_text, {"open_url"})
+    assert clean == ""
+    assert tool_calls == []
+
+    clean, tool_calls = parse_tool_calls_from_text(undeclared_text, {"allowed_tool"})
+    assert clean == ""
+    assert tool_calls == []
+
+
+def test_parse_ignores_dsml_markup_inside_code_fence():
+    text = (
+        "```xml\n"
+        "<|DSML|tool_calls><|DSML|invoke name=\"get_weather\"></|DSML|invoke></|DSML|tool_calls>\n"
+        "```"
+    )
+
+    clean, tool_calls = parse_tool_calls_from_text(text, {"get_weather"})
+
+    assert clean == text
+    assert tool_calls == []
+
+
+def test_streaming_tool_parser_never_leaks_dsml_markup_fragments():
+    parser = StreamingToolParser(allowed_tool_names={"get_weather"})
+    visible_parts: list[str] = []
+    payload = (
+        "<|DSML|tool_calls><|DSML|invoke name=\"get_weather\">"
+        "<|DSML|parameter name=\"city\">上海</|DSML|parameter>"
+        "</|DSML|invoke></|DSML|tool_calls>"
+    )
+
+    for char in payload:
+        piece = parser.consume(char)
+        visible_parts.append(piece)
+        assert "<|DSML|" not in piece
+        assert "</|DSML|" not in piece
+
+    tail, tool_calls = parser.flush()
+
+    assert "".join(visible_parts) == ""
+    assert tail == ""
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["arguments"] == '{"city":"上海"}'
+
+
 def test_parse_tool_calls_from_xml_markup():
     text = (
         "开始\n"
@@ -109,7 +202,7 @@ def test_parse_rejects_tool_call_missing_parameters():
     assert tool_calls == []
 
 
-def test_parse_salvages_malformed_tool_calls_root_and_strips_web_tool_chatter():
+def test_parse_salvages_malformed_tool_calls_root_without_rewriting_model_text():
     text = (
         "open_url工具被阻止，无法使用。让我改用 fetchJson 工具来访问这个 API："
         "非常抱歉，我之前反复调用了被阻止的工具。"
@@ -122,7 +215,7 @@ def test_parse_salvages_malformed_tool_calls_root_and_strips_web_tool_chatter():
 
     clean, tool_calls = parse_tool_calls_from_text(text, {"mcp__CherryFetch__fetchJson"})
 
-    assert clean == ""
+    assert "open_url" in clean
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "mcp__CherryFetch__fetchJson"
     assert tool_calls[0]["function"]["arguments"] == '{"url":"https://example.com/data.json"}'

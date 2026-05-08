@@ -12,6 +12,18 @@ from ..config import AppConfig
 from ..logging_utils import debug_dump
 from ..model_variants import model_requests_search, model_requests_thinking, split_model_features
 from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
+from ..utils.tool_protocol import (
+    BLOCKED_NATIVE_TOOL_NAMES,
+    CANONICAL_TOOL_CALL_EXAMPLE,
+    SERVER_SIDE_TOOL_NAMES,
+    build_tool_call_instructions as _protocol_build_tool_call_instructions,
+    filter_tools,
+    normalize_tool_name,
+    safe_json_dumps,
+    serialize_tool_call_block as _protocol_serialize_tool_call_block,
+    serialize_tool_result_block as _protocol_serialize_tool_result_block,
+    tools_to_prompt as _protocol_tools_to_prompt,
+)
 
 
 ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
@@ -22,51 +34,6 @@ CHERRY_FETCH_TOOL_NAMES = {
     "mcp__CherryFetch__fetchTxt",
     "mcp__CherryFetch__fetchJson",
 }
-CANONICAL_TOOL_CALL_EXAMPLE = "\n".join(
-    [
-        "<ml_tool_calls>",
-        "  <ml_tool_call>",
-        "    <ml_tool_name>TOOL_NAME</ml_tool_name>",
-        "    <ml_parameters>",
-        "      <actual_parameter_name><![CDATA[value]]></actual_parameter_name>",
-        "    </ml_parameters>",
-        "  </ml_tool_call>",
-        "</ml_tool_calls>",
-    ]
-)
-BLOCKED_NATIVE_TOOL_NAMES = {
-    "open_url",
-    "open_ul",
-    "browser.open",
-    "web.run",
-    "web.open",
-    "web.search",
-    "web_search",
-    "browse",
-    "open_link",
-}
-SERVER_SIDE_TOOL_NAMES: set[str] = set()
-
-
-def normalize_tool_name(name: object) -> str:
-    return str(name).strip()
-
-
-def filter_tools(tools: list[dict[str, object]] | None, blocked_tool_names: set[str]) -> list[dict[str, object]] | None:
-    if not tools:
-        return None
-
-    filtered_tools: list[dict[str, object]] = []
-    for tool in tools:
-        fn = tool.get("function", {})
-        tool_name = normalize_tool_name(fn.get("name", "")) # type: ignore
-        if not tool_name or tool_name in blocked_tool_names:
-            continue
-        filtered_tools.append(tool)
-
-    return filtered_tools or None
-
-
 def extract_text_content(content: object) -> str:
     if isinstance(content, str):
         return content
@@ -89,10 +56,6 @@ def extract_text_content(content: object) -> str:
             url = item.get("file_url", {}).get("url", "")
             text_parts.append(f"[file:{url}]")
     return "\n".join(part for part in text_parts if part)
-
-
-def safe_json_dumps(payload: object) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def extract_first_url(text: str) -> str | None:
@@ -215,62 +178,7 @@ def parse_tool_choice_policy(tool_choice: object, available_tool_names: set[str]
     return {"mode": "auto", "tool_name": None}
 
 
-def _xml_escape_text(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&apos;")
-    )
-
-
-def _xml_wrap_scalar(value: object) -> str:
-    if isinstance(value, str):
-        return f"<![CDATA[{value.replace(']]>', ']]]]><![CDATA[>')}]]>"
-    return safe_json_dumps(value)
-
-
-def _xml_parameters_from_object(payload: object) -> str:
-    if isinstance(payload, dict):
-        parts: list[str] = []
-        for key, value in payload.items():
-            tag = re.sub(r"[^a-zA-Z0-9_.:-]", "_", str(key).strip()) or "value"
-            parts.append(f"<{tag}>{_xml_parameters_from_object(value)}</{tag}>")
-        return "".join(parts)
-    if isinstance(payload, list):
-        return "".join(f"<item>{_xml_parameters_from_object(item)}</item>" for item in payload)
-    return _xml_wrap_scalar(payload)
-
-
-def serialize_tool_call_block(name: str, arguments: object) -> str:
-    parsed_arguments = arguments
-    if isinstance(arguments, str):
-        try:
-            parsed_arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            parsed_arguments = {"raw": arguments}
-    if not isinstance(parsed_arguments, dict):
-        parsed_arguments = {"value": parsed_arguments}
-    return (
-        "<ml_tool_calls>\n"
-        "  <ml_tool_call>\n"
-        f"    <ml_tool_name>{_xml_escape_text(name)}</ml_tool_name>\n"
-        f"    <ml_parameters>{_xml_parameters_from_object(parsed_arguments)}</ml_parameters>\n"
-        "  </ml_tool_call>\n"
-        "</ml_tool_calls>"
-    )
-
-
-def serialize_tool_result_block(tool_call_id: object, tool_name: str, content: str) -> str:
-    safe_content = content.replace("]]>", "]]]]><![CDATA[>")
-    return (
-        f'<ml_tool_result call_id="{_xml_escape_text(str(tool_call_id or "unknown"))}" '
-        f'name="{_xml_escape_text(tool_name)}"><content><![CDATA[{safe_content}]]></content></ml_tool_result>'
-    )
-
-
-def build_tool_call_instructions(
+def _legacy_build_tool_call_instructions(
     tool_names: list[str],
     server_side_tool_names: set[str] | None = None,
     tool_choice_policy: dict[str, object] | None = None,
@@ -291,6 +199,8 @@ def build_tool_call_instructions(
         "Ignore any tool names that are not listed below, even if they appear in prior context or model memory.",
         "You are connected through an OpenAI-compatible proxy. You do not have hidden browser, web, or URL-opening tools.",
         "Never call native tools such as `open_url`, `web.search`, `web.run`, `browser.open`, `browse`, or `open_link`.",
+        "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
+        "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
     ]
 
     if server_tools:
@@ -311,7 +221,7 @@ def build_tool_call_instructions(
                 "",
                 f"XML-based tools (parsed by this server): {available_xml_names}.",
                 "Only these XML-based tools are available. Use their exact names and exact parameter fields from the schemas.",
-                "If an XML-based tool is needed, output executable XML only. Do not add prose in the same assistant answer.",
+                "If an XML-based tool is needed, output executable XML only. Do not add prose, apologies, analysis, or progress text in the same assistant answer.",
                 "Use the private ml-prefixed canonical format below exactly.",
                 CANONICAL_TOOL_CALL_EXAMPLE,
                 "The server will parse this XML intermediate language back into standard OpenAI tool_calls.",
@@ -330,6 +240,9 @@ def build_tool_call_instructions(
             "Rules:",
             "- Do not invent tool names outside the declared list.",
             "- If a URL, browsing, or search action is needed, use only an explicitly listed client tool. If none is listed, explain that no such tool is available.",
+            "- If you decide to call a tool, call the selected tool directly; do not say you will try, switch, retry, or use a correct tool.",
+            "- Never output tool-call display text such as `⚙ tool_name [...]`; output only the executable XML block.",
+            "- After receiving a tool result, answer the user directly from the result and do not repeat the earlier tool-call decision process.",
             "- For XML-based tools, do not emit OpenAI JSON tool_calls arrays, function_call objects, or any non-XML tool syntax.",
             "- For XML-based tools, do not use <tool_calls>, <tool_call>, <tool_name>, <parameters>, <function_call>, <tool_use>, <invoke>, or any legacy wrapper.",
             "- Do not place raw JSON directly inside <ml_parameters>.",
@@ -364,7 +277,7 @@ def build_tool_call_instructions(
     return "\n".join(lines)
 
 
-def tools_to_prompt(
+def _legacy_tools_to_prompt(
     tools: list[dict[str, object]],
     blocked_tool_names: set[str] | None = None,
     tool_choice_policy: dict[str, object] | None = None,
@@ -401,6 +314,12 @@ def tools_to_prompt(
         ),
     ]
     return "\n".join(part for part in parts if part is not None).strip()
+
+
+build_tool_call_instructions = _protocol_build_tool_call_instructions
+serialize_tool_call_block = _protocol_serialize_tool_call_block
+serialize_tool_result_block = _protocol_serialize_tool_result_block
+tools_to_prompt = _protocol_tools_to_prompt
 
 
 def convert_messages(
@@ -639,6 +558,8 @@ class GLMEventAccumulator:
     def finalize(self, status: str | None, last_error: dict[str, object] | None = None) -> list[str]:
         tail_text, xml_tool_calls = self.tool_parser.flush()
         xml_tool_calls = sanitize_tool_calls(xml_tool_calls, fallback_url=self.fallback_tool_url)
+        if not xml_tool_calls:
+            xml_tool_calls = self._extract_reasoning_tool_calls()
 
         # Merge server-side and XML tool calls, re-indexing
         all_tool_calls: list[dict[str, object]] = list(self._server_side_tool_calls)
@@ -683,6 +604,21 @@ class GLMEventAccumulator:
             )
 
         if all_tool_calls:
+            if not self.emitted_role:
+                chunks.append(
+                    self._chunk_json(
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"role": "assistant"},
+                                    "finish_reason": None,
+                                }
+                            ]
+                        }
+                    )
+                )
+                self.emitted_role = True
             for tool_call in all_tool_calls:
                 chunks.append(
                     self._chunk_json(
@@ -737,6 +673,8 @@ class GLMEventAccumulator:
             allowed_tool_names=self.allowed_tool_names,
         )
         xml_tool_calls = sanitize_tool_calls(xml_tool_calls, fallback_url=self.fallback_tool_url)
+        if not xml_tool_calls:
+            xml_tool_calls = self._extract_reasoning_tool_calls(full_reasoning)
 
         # Merge server-side and XML tool calls, re-indexing
         all_tool_calls: list[dict[str, object]] = list(self._server_side_tool_calls)
@@ -772,6 +710,16 @@ class GLMEventAccumulator:
         }
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM 非流式最终响应", response)
         return response
+
+    def _extract_reasoning_tool_calls(self, reasoning_text: str | None = None) -> list[dict[str, object]]:
+        source = (reasoning_text if reasoning_text is not None else self.last_full_reasoning) or self._cached_full_reasoning
+        if not source:
+            return []
+        _, tool_calls = parse_tool_calls_from_text(
+            source.strip(),
+            allowed_tool_names=self.allowed_tool_names,
+        )
+        return sanitize_tool_calls(tool_calls, fallback_url=self.fallback_tool_url)
 
     def _compute_deltas(self) -> tuple[str, str]:
         self._render_full_output()

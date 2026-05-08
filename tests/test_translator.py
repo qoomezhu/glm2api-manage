@@ -41,14 +41,17 @@ def test_convert_messages_injects_xml_tool_prompt_and_history():
 
     prompt = converted[0]["content"][0]["text"]
 
-    assert "<ml_tool_calls>" in prompt
-    assert "<ml_tool_result call_id=\"call_1\" name=\"get_weather\">" in prompt
+    assert "<|DSML|tool_calls>" in prompt
+    assert "<|DSML|invoke name=\"get_weather\">" in prompt
+    assert "<|DSML|tool_result call_id=\"call_1\" name=\"get_weather\">" in prompt
+    assert "<ml_tool_calls>" not in prompt
     assert "# TOOL USE PROTOCOL" in prompt
-    assert "Use the private ml-prefixed canonical format below exactly." in prompt
-    assert "The server will parse this XML intermediate language back into standard OpenAI tool_calls." in prompt
-    assert "<actual_parameter_name><![CDATA[value]]></actual_parameter_name>" in prompt
-    assert "never use a literal <param_name> placeholder tag" in prompt
-    assert "For XML-based tools, do not use <tool_calls>, <tool_call>, <tool_name>, <parameters>, <function_call>, <tool_use>, <invoke>, or any legacy wrapper." in prompt
+    assert "Use the DSML format below exactly." in prompt
+    assert "The server will parse this DSML block back into standard OpenAI tool_calls." in prompt
+    assert "<|DSML|parameter name=\"actual_parameter_name\"><![CDATA[value]]></|DSML|parameter>" in prompt
+    assert "Each argument must be a <|DSML|parameter name=\"...\"> child of the invoke." in prompt
+    assert "Parameter names are case-sensitive and must exactly match the schema." in prompt
+    assert "never change it to `filepath`, `file_path`, or `FilePath`." in prompt
     assert "# BLOCKED TOOLS" not in prompt
     assert "Ignore any tool names that are not listed below" in prompt
 
@@ -64,8 +67,9 @@ def test_accumulator_build_response_maps_xml_to_openai_tool_calls():
                     "content": [
                         {
                             "type": "text",
-                            "text": "<ml_tool_calls><ml_tool_call><ml_tool_name>get_weather</ml_tool_name>"
-                            "<ml_parameters><city>上海</city></ml_parameters></ml_tool_call></ml_tool_calls>",
+                            "text": "<|DSML|tool_calls><|DSML|invoke name=\"get_weather\">"
+                            "<|DSML|parameter name=\"city\">上海</|DSML|parameter>"
+                            "</|DSML|invoke></|DSML|tool_calls>",
                         }
                     ],
                 }
@@ -80,6 +84,101 @@ def test_accumulator_build_response_maps_xml_to_openai_tool_calls():
     assert message["content"] is None
     assert message["tool_calls"][0]["function"]["name"] == "get_weather"
     assert message["tool_calls"][0]["function"]["arguments"] == '{"city":"上海"}'
+
+
+def test_accumulator_streaming_tool_call_emits_assistant_role_before_tool_delta():
+    accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"write"})
+    chunks, status = accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<|DSML|tool_calls><|DSML|invoke name=\"write\">"
+                            "<|DSML|parameter name=\"filePath\">test.txt</|DSML|parameter>"
+                            "<|DSML|parameter name=\"content\"></|DSML|parameter>"
+                            "</|DSML|invoke></|DSML|tool_calls>",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    final_chunks = accumulator.finalize(status)
+
+    assert chunks == []
+    assert '"delta":{"role":"assistant"}' in final_chunks[0]
+    assert '"tool_calls"' in final_chunks[1]
+    assert '"finish_reason":"tool_calls"' in final_chunks[2]
+
+
+def test_accumulator_streaming_extracts_tool_call_from_reasoning_fallback():
+    accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"write"})
+    chunks, status = accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "think",
+                            "think": "I should call the tool.\n"
+                            "<|DSML|tool_calls><|DSML|invoke name=\"write\">"
+                            "<|DSML|parameter name=\"filePath\">test.txt</|DSML|parameter>"
+                            "<|DSML|parameter name=\"content\"></|DSML|parameter>"
+                            "</|DSML|invoke></|DSML|tool_calls>",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    final_chunks = accumulator.finalize(status)
+
+    assert chunks
+    assert '"reasoning_content"' in chunks[0]
+    assert '"delta":{"role":"assistant"}' in final_chunks[0]
+    assert '"tool_calls"' in final_chunks[1]
+    assert '\\"filePath\\":\\"test.txt\\"' in final_chunks[1]
+
+
+def test_accumulator_build_response_extracts_tool_call_from_reasoning_fallback():
+    accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"write"})
+    accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "think",
+                            "think": "<|DSML|tool_calls><|DSML|invoke name=\"write\">"
+                            "<|DSML|parameter name=\"filePath\">test.txt</|DSML|parameter>"
+                            "<|DSML|parameter name=\"content\"></|DSML|parameter>"
+                            "</|DSML|invoke></|DSML|tool_calls>",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    response = accumulator.build_response()
+    message = response["choices"][0]["message"]
+
+    assert response["choices"][0]["finish_reason"] == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "write"
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"filePath":"test.txt","content":""}'
 
 
 def test_convert_messages_respects_tool_choice_none_and_specific():
@@ -149,6 +248,9 @@ def test_convert_messages_filters_native_url_tools_and_reinforces_tool_awareness
     assert "Tool: mcp__CherryFetch__fetchJson" in prompt
     assert "You do not have hidden browser, web, or URL-opening tools." in prompt
     assert "Never call native tools such as `open_url`" in prompt
+    assert "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`." in prompt
+    assert "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners." in prompt
+    assert "Never output tool-call display text such as `⚙ tool_name [...]`" in prompt
 
 
 def test_convert_messages_drops_blocked_tool_call_history():
@@ -182,7 +284,7 @@ def test_convert_messages_drops_blocked_tool_call_history():
 
     prompt = converted[0]["content"][0]["text"]
 
-    assert "<ml_tool_name>open_url</ml_tool_name>" not in prompt
+    assert "name=\"open_url\"" not in prompt
     assert "Tool: mcp__CherryFetch__fetchJson" in prompt
 
 
@@ -230,7 +332,10 @@ def test_convert_messages_repairs_cherry_fetch_url_and_skips_invalid_tool_error_
 
     prompt = converted[0]["content"][0]["text"]
 
-    assert "<url><![CDATA[https://opendata.baidu.com/api.php?query=1.1.1.1&co=&resource_id=6006&oe=utf8]]></url>" in prompt
+    assert (
+        "<|DSML|parameter name=\"url\"><![CDATA[https://opendata.baidu.com/api.php?query=1.1.1.1&co=&resource_id=6006&oe=utf8]]></|DSML|parameter>"
+        in prompt
+    )
     assert "expected string, received undefined" not in prompt
 
 
