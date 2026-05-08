@@ -5,6 +5,7 @@
 支持的主要接口：
 
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `POST /v1/images/generations`
 - `GET /v1/models`
 - `GET /health`
@@ -229,6 +230,26 @@ for chunk in stream:
     delta = chunk.choices[0].delta
     if getattr(delta, "content", None):
         print(delta.content, end="")
+```
+
+### 7.4 OpenAI Responses API 示例
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="dummy",
+)
+
+resp = client.responses.create(
+    model="glm-4",
+    input=[
+        {"role": "user", "content": "你好，介绍一下你自己"}
+    ],
+)
+
+print(resp.output_text)
 ```
 
 ## 8. 图片生成接口

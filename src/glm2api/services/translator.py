@@ -91,7 +91,9 @@ def sanitize_tool_call_payload(
         return None
 
     cleaned = {str(key): value for key, value in parsed_arguments.items()}
-    if cleaned == {"param_name": "url"}:
+    if cleaned == {"param_name": "url"} and fallback_url:
+        cleaned = {"url": fallback_url}
+    elif cleaned == {"param_name": "url"}:
         cleaned = {}
     if "param_name" in cleaned and "param_value" not in cleaned and len(cleaned) == 1:
         cleaned = {}

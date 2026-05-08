@@ -15,6 +15,58 @@ def _safe_json(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
+def _response_part_to_openai(part: dict[str, object]) -> dict[str, object] | None:
+    part_type = part.get("type")
+    if part_type in {"input_text", "output_text", "text"}:
+        return {"type": "text", "text": part.get("text", "")}
+    if part_type in {"input_image", "image_url"}:
+        image_url = part.get("image_url") or part.get("url")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
+        if not image_url:
+            return None
+        converted: dict[str, object] = {"type": "image_url", "image_url": {"url": str(image_url)}}
+        detail = part.get("detail")
+        if detail:
+            converted["image_url"]["detail"] = detail  # type: ignore[index]
+        return converted
+    if part_type in {"input_file", "file"}:
+        file_url = part.get("file_url")
+        if isinstance(file_url, dict):
+            file_url = file_url.get("url")
+        if not file_url:
+            return None
+        return {"type": "file", "file_url": {"url": str(file_url)}}
+    return None
+
+
+def _response_content_to_openai(content: object) -> object | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+
+    openai_parts: list[dict[str, object]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        converted = _response_part_to_openai(part)
+        if converted:
+            openai_parts.append(converted)
+    if len(openai_parts) == 1 and openai_parts[0].get("type") == "text":
+        return openai_parts[0].get("text", "")
+    if openai_parts:
+        return openai_parts
+    return None
+
+
+def _append_response_message(messages: list[dict[str, object]], item: dict[str, object]) -> None:
+    role = str(item.get("role", "user"))
+    converted_content = _response_content_to_openai(item.get("content"))
+    if converted_content is not None:
+        messages.append({"role": role, "content": converted_content})
+
+
 # ---------------------------------------------------------------------------
 # Request conversion: Responses -> OpenAI chat/completions
 # ---------------------------------------------------------------------------
@@ -38,30 +90,9 @@ def responses_to_openai(payload: dict[str, object]) -> dict[str, object]:
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
-            item_role = str(item.get("role", "user"))
 
-            if item_type == "message":
-                content = item.get("content")
-                if isinstance(content, str):
-                    messages.append({"role": item_role, "content": content})
-                elif isinstance(content, list):
-                    openai_parts: list[dict[str, object]] = []
-                    for part in content:
-                        if not isinstance(part, dict):
-                            continue
-                        part_type = part.get("type")
-                        if part_type == "input_text":
-                            openai_parts.append({"type": "text", "text": part.get("text", "")})
-                        elif part_type == "input_image":
-                            image_url = part.get("image_url")
-                            if image_url:
-                                openai_parts.append({"type": "image_url", "image_url": {"url": str(image_url)}})
-                        elif part_type == "output_text":
-                            openai_parts.append({"type": "text", "text": part.get("text", "")})
-                    if len(openai_parts) == 1 and openai_parts[0].get("type") == "text":
-                        messages.append({"role": item_role, "content": openai_parts[0].get("text", "")})
-                    elif openai_parts:
-                        messages.append({"role": item_role, "content": openai_parts})
+            if item_type == "message" or (item_type is None and "content" in item):
+                _append_response_message(messages, item)
 
             elif item_type == "function_call_output":
                 call_id = str(item.get("call_id", ""))
@@ -129,14 +160,19 @@ def responses_to_openai(payload: dict[str, object]) -> dict[str, object]:
             if not isinstance(tool, dict):
                 continue
             if tool.get("type") == "function":
-                openai_tools.append({
+                function_tool = {
                     "type": "function",
                     "function": {
                         "name": tool.get("name", ""),
                         "description": tool.get("description", ""),
                         "parameters": tool.get("parameters", {}),
                     },
-                })
+                }
+                if tool.get("strict") is not None:
+                    function_tool["function"]["strict"] = tool["strict"]  # type: ignore[index]
+                openai_tools.append(function_tool)
+            elif str(tool.get("type", "")).startswith("web_search"):
+                result["web_search"] = True
         if openai_tools:
             result["tools"] = openai_tools
     if payload.get("tool_choice") is not None:
@@ -162,7 +198,9 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     output: list[dict[str, object]] = []
+    output_text_parts: list[str] = []
     status = "completed"
+    incomplete_details = None
 
     choices = result.get("choices", [])
     if isinstance(choices, list) and choices:
@@ -179,6 +217,7 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
 
                 text = message.get("content")
                 if text:
+                    output_text_parts.append(str(text))
                     msg_content.append({
                         "type": "output_text",
                         "text": str(text),
@@ -217,6 +256,7 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
             finish_reason = choice.get("finish_reason")
             if finish_reason == "length":
                 status = "incomplete"
+                incomplete_details = {"reason": "max_output_tokens"}
 
     usage = result.get("usage", {})
     input_tokens = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
@@ -227,8 +267,15 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
         "object": "response",
         "created_at": created,
         "status": status,
+        "error": None,
+        "incomplete_details": incomplete_details,
+        "instructions": None,
         "model": model,
         "output": output,
+        "output_text": "".join(output_text_parts),
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "store": False,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -264,6 +311,7 @@ class ResponsesStreamAccumulator:
         self._content_part_started = False
         self._completed_output: list[dict[str, object]] = []
         self._finished = False
+        self.sequence_number = 0
 
     def _base_response(self, status: str = "in_progress") -> dict[str, object]:
         return {
@@ -537,4 +585,11 @@ class ResponsesStreamAccumulator:
         return events
 
     def _sse(self, event_type: str, data: dict[str, object]) -> str:
-        return f"event: {event_type}\ndata: {_safe_json(data)}\n\n"
+        if data.get("object") == "response":
+            event_payload: dict[str, object] = {"type": event_type, "response": data}
+        else:
+            event_payload = dict(data)
+            event_payload["type"] = event_type
+        event_payload["sequence_number"] = self.sequence_number
+        self.sequence_number += 1
+        return f"event: {event_type}\ndata: {_safe_json(event_payload)}\n\n"
