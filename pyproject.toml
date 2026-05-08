@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "glm2api"
 version = "0.1.0"
@@ -8,6 +12,9 @@ dependencies = []
 
 [project.scripts]
 glm2api = "glm2api.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
