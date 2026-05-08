@@ -128,6 +128,20 @@ def test_parse_tool_calls_repairs_json_array_at_cdata_boundary():
     assert tool_calls[0]["function"]["arguments"] == '{"command":["powershell.exe","-Command","pwd"]}'
 
 
+def test_parse_tool_calls_repairs_missing_final_dsml_close_angle():
+    text = (
+        '<|DSML|tool_calls><|DSML|invoke name="shell">'
+        '<|DSML|parameter name="command"><![CDATA[["powershell.exe", "-Command", "pwd"]]></|DSML|parameter>'
+        '</|DSML|invoke></|DSML|tool_calls'
+    )
+
+    clean, tool_calls = parse_tool_calls_from_text(text, {"shell"})
+
+    assert clean == ""
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["arguments"] == '{"command":["powershell.exe","-Command","pwd"]}'
+
+
 def test_streaming_tool_parser_hides_glm_malformed_dsml_until_flush():
     parser = StreamingToolParser(allowed_tool_names={"shell"})
     payload = (

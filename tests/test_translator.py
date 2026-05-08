@@ -214,6 +214,59 @@ def test_sanitize_shell_command_argument_from_quoted_sequence():
     }
 
 
+def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
+    accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"shell"})
+    chunks, status = accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "我将创建文件。\n\n"
+                            '<|DSML|tool_calls><|DSML|invoke name="shell">'
+                            '<|DSML|parameter name="command"><![CDATA[["powershell.exe", "-Command", "pwd"]]></|DSML|parameter>'
+                            "</|DSML|invoke></|DSML|tool_calls>",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    final_chunks = accumulator.finalize(status)
+
+    assert chunks == []
+    assert "我将创建文件" not in "".join(final_chunks)
+    assert '"tool_calls"' in final_chunks[1]
+    assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[1]
+
+
+def test_accumulator_defers_visible_text_when_tools_available():
+    accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"shell"})
+    chunks, status = accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [{"type": "text", "text": "你好"}],
+                }
+            ],
+        }
+    )
+
+    final_chunks = accumulator.finalize(status)
+
+    assert chunks == []
+    assert '"content":"你好"' in final_chunks[0]
+    assert '"finish_reason":"stop"' in final_chunks[1]
+
+
 def test_convert_messages_respects_tool_choice_none_and_specific():
     none_converted = convert_messages(
         messages=[{"role": "user", "content": "直接回答"}],

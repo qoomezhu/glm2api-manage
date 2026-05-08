@@ -34,6 +34,10 @@ DSML_TOOL_CALLS_CLOSE_PATTERN = re.compile(
     r"(?:</\|dsml\|tool_calls\s*>|</\|dsml\|tool_calls\s*\|\s*>|</\|dsmltool_?calls\s*\|\s*>|<\|/dsmltool_?calls\s*\|\s*>)",
     re.IGNORECASE,
 )
+DSML_TOOL_CALLS_TRAILING_CLOSE_PATTERN = re.compile(
+    r"(?:</\|dsml\|tool_calls\s*>|</\|dsml\|tool_calls\s*\|\s*>|</\|dsmltool_?calls\s*\|\s*>|<\|/dsmltool_?calls\s*\|\s*>|</\|dsml\|tool_calls\s*$|</\|dsmltool_?calls\s*\|?\s*$|<\|/dsmltool_?calls\s*\|?\s*$)",
+    re.IGNORECASE,
+)
 PARAM_NAME_TAG_PATTERN = re.compile(r"<param_name>\s*(.*?)\s*</param_name>", re.IGNORECASE | re.DOTALL)
 PARAM_VALUE_TAG_PATTERN = re.compile(r"<param_value>\s*(.*?)\s*</param_value>", re.IGNORECASE | re.DOTALL)
 TAG_NAME_HINTS = [
@@ -106,6 +110,12 @@ def _repair_malformed_dsml(block: str) -> str:
     repaired = DSML_OPEN_TAG_PATTERN.sub(replace_open, repaired)
     repaired = DSML_CLOSE_TAG_PATTERN.sub(replace_close, repaired)
     repaired = DSML_COMPACT_CLOSE_TAG_PATTERN.sub(replace_close, repaired)
+    repaired = re.sub(
+        r"(?:</\|dsml\|tool_calls|</\|dsmltool_?calls|<\|/dsmltool_?calls)\s*\|?\s*$",
+        "</|DSML|tool_calls>",
+        repaired,
+        flags=re.IGNORECASE,
+    )
     return repaired
 
 
@@ -347,10 +357,15 @@ def _mask_code_fences(text: str) -> str:
     return "".join(masked)
 
 
-def _find_matching_block(masked_text: str, start_match: re.Match[str]) -> tuple[int, int] | None:
+def _find_matching_block(
+    masked_text: str,
+    start_match: re.Match[str],
+    *,
+    allow_trailing_close: bool = False,
+) -> tuple[int, int] | None:
     tag_name = start_match.group("tag").lower()
     if tag_name == "|dsml|tool_calls":
-        closing_pattern = DSML_TOOL_CALLS_CLOSE_PATTERN
+        closing_pattern = DSML_TOOL_CALLS_TRAILING_CLOSE_PATTERN if allow_trailing_close else DSML_TOOL_CALLS_CLOSE_PATTERN
     else:
         closing_pattern = re.compile(rf"</{re.escape(tag_name)}\s*>", re.IGNORECASE)
     closing_match = closing_pattern.search(masked_text, start_match.end())
@@ -359,7 +374,12 @@ def _find_matching_block(masked_text: str, start_match: re.Match[str]) -> tuple[
     return start_match.start(), closing_match.end()
 
 
-def _extract_tool_blocks(text: str, allowed_tool_names: set[str] | None) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
+def _extract_tool_blocks(
+    text: str,
+    allowed_tool_names: set[str] | None,
+    *,
+    allow_trailing_close: bool = False,
+) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
     masked_text = _mask_code_fences(text)
     spans: list[tuple[int, int]] = []
     tool_calls: list[dict[str, object]] = []
@@ -369,7 +389,7 @@ def _extract_tool_blocks(text: str, allowed_tool_names: set[str] | None) -> tupl
         match = START_TAG_PATTERN.search(masked_text, cursor)
         if match is None:
             break
-        span = _find_matching_block(masked_text, match)
+        span = _find_matching_block(masked_text, match, allow_trailing_close=allow_trailing_close)
         if span is None:
             break
 
@@ -427,14 +447,14 @@ def _find_unmatched_fence_start(text: str) -> int | None:
     return last_open
 
 
-def _find_incomplete_block_start(text: str) -> int | None:
+def _find_incomplete_block_start(text: str, *, allow_trailing_close: bool = False) -> int | None:
     masked_text = _mask_code_fences(text)
     cursor = 0
     while cursor < len(masked_text):
         match = START_TAG_PATTERN.search(masked_text, cursor)
         if match is None:
             break
-        span = _find_matching_block(masked_text, match)
+        span = _find_matching_block(masked_text, match, allow_trailing_close=allow_trailing_close)
         if span is None:
             return match.start()
         cursor = span[1]
@@ -482,7 +502,7 @@ def _split_stream_text(
 ) -> tuple[str, str, list[dict[str, object]]]:
     hold_from_candidates = [
         index
-        for index in (_find_unmatched_fence_start(text), _find_incomplete_block_start(text))
+        for index in (_find_unmatched_fence_start(text), _find_incomplete_block_start(text, allow_trailing_close=final))
         if index is not None
     ]
 
@@ -500,7 +520,7 @@ def _split_stream_text(
 
     processable = text[:safe_end]
     remainder = text[safe_end:]
-    spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names)
+    spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names, allow_trailing_close=final)
     visible = _remove_spans(processable, spans, trim_outer_whitespace=final)
     return visible, remainder, tool_calls
 
@@ -508,7 +528,7 @@ def _split_stream_text(
 def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = None) -> tuple[str, list[dict[str, object]]]:
     if not text:
         return "", []
-    spans, tool_calls = _extract_tool_blocks(text, allowed_tool_names)
+    spans, tool_calls = _extract_tool_blocks(text, allowed_tool_names, allow_trailing_close=True)
     return _remove_spans(text, spans), tool_calls
 
 
