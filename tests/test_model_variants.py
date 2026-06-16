@@ -1,3 +1,4 @@
+from glm2api.config import BUILTIN_MODEL_ALIASES, BUILTIN_EXPOSED_MODELS
 from glm2api.model_variants import expand_model_variants, split_model_features
 from glm2api.services.translator import resolve_chat_mode, resolve_networking, resolve_upstream_model
 
@@ -51,3 +52,8 @@ def test_model_suffixes_resolve_chat_mode_and_networking_matrix():
 
 def test_existing_thinking_model_name_still_enables_chat_mode():
     assert resolve_chat_mode("glm-4.1v-thinking-flashx", None, None) == "zero"
+
+
+def test_glm_5_2_is_exposed_and_passed_through():
+    assert "glm-5.2" in BUILTIN_EXPOSED_MODELS
+    assert BUILTIN_MODEL_ALIASES["glm-5.2"] == "glm-5.2"
