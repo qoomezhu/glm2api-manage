@@ -1,6 +1,6 @@
 # ChatGLM 2 API
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FXxxXTeam%2Fglm2api&env=ADMIN_KEY&envDescription=%E7%AE%A1%E7%90%86%E9%9D%A2%E6%9D%BF%E7%99%BB%E5%BD%95%E5%AF%86%E9%92%A5%EF%BC%8C%E9%BB%98%E8%AE%A4%E4%B8%BA%20glm2api-admin)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ft479842598%2Fglm2api-manage&env=ADMIN_KEY&envDescription=%E7%AE%A1%E7%90%86%E9%9D%A2%E6%9D%BF%E7%99%BB%E5%BD%95%E5%AF%86%E9%92%A5%EF%BC%8C%E9%BB%98%E8%AE%A4%E4%B8%BA%20glm2api-admin)
 
 `glm2api` 是一个**零外部依赖**的本地代理服务，把 `chatglm.cn` 的网页接口转换成 OpenAI / Anthropic 兼容接口。直接接入 OpenAI SDK、Cherry Studio、Open WebUI、LobeChat 或任何兼容 OpenAI API 的工具。
 
@@ -51,7 +51,7 @@
 
 ```bash
 # 1. 克隆项目
-git clone https://github.com/XxxXTeam/glm2api.git
+git clone https://github.com/t479842598/glm2api-manage.git
 cd glm2api
 
 # 2. 安装（零外部依赖，仅需要 setuptools）
@@ -147,7 +147,7 @@ API Key 会自动保存到 `.env` 文件的 `GLM2API_API_KEYS` 字段（JSON 格
 
 点击下方按钮，30 秒完成部署：
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FXxxXTeam%2Fglm2api&env=ADMIN_KEY&envDescription=%E7%AE%A1%E7%90%86%E9%9D%A2%E6%9D%BF%E7%99%BB%E5%BD%95%E5%AF%86%E9%92%A5%EF%BC%8C%E9%BB%98%E8%AE%A4%E4%B8%BA%20glm2api-admin)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ft479842598%2Fglm2api-manage&env=ADMIN_KEY&envDescription=%E7%AE%A1%E7%90%86%E9%9D%A2%E6%9D%BF%E7%99%BB%E5%BD%95%E5%AF%86%E9%92%A5%EF%BC%8C%E9%BB%98%E8%AE%A4%E4%B8%BA%20glm2api-admin)
 
 部署后，Vercel 会分配一个域名如 `https://你的项目.vercel.app`。
 
