@@ -517,6 +517,8 @@ class GLM2APIServer:
 
             # ---- Chat completions (original) ----
 
+            STREAM_HEARTBEAT_SECONDS = 25.0
+
             def _stream_completion(self, payload: dict[str, object]) -> None:
                 model = str(payload.get("model", "unknown"))
                 logger.info("开始流式响应 model=%s", model)
@@ -528,15 +530,42 @@ class GLM2APIServer:
                 self.send_header("Connection", "close")
                 self.end_headers()
 
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_upstream() -> None:
+                    try:
+                        for upstream_chunk in stream_iter:
+                            if upstream_chunk:
+                                chunk_queue.put(upstream_chunk)
+                    except BaseException as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
                 sent_done = False
                 try:
-                    for chunk in stream_iter:
-                        if chunk:
-                            debug_dump(logger, config.debug_dump_all, f"HTTP 出站流式分片 model={model}", chunk)
-                            self.wfile.write(chunk)
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=self.__class__.STREAM_HEARTBEAT_SECONDS)
+                        except queue.Empty:
+                            self.wfile.write(b": keepalive\n\n")
                             self.wfile.flush()
-                            if b"data: [DONE]\n\n" in chunk:
-                                sent_done = True
+                            continue
+
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+
+                        chunk = queued
+                        debug_dump(logger, config.debug_dump_all, f"HTTP 出站流式分片 model={model}", chunk)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        if b"data: [DONE]\n\n" in chunk:
+                            sent_done = True
                 except UpstreamAPIError as exc:
                     logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
                     self._write_sse_error(str(exc), "upstream_error")

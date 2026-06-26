@@ -14,6 +14,7 @@
   3. `_raise_for_event_error` 在 event status 为 `"error"` 但无任何错误负载时仍抛 `"GLM stream request error"` 兜底错误 → 已新增安全阀：**没有具体错误负载时，即使 event status 是 `"error"` 也不抛错**，仅记日志
 - **修复 keepalive 心跳 30 秒超时实际未生效** — `sock = getattr(response, "fp", None)` 拿到的是 `HTTPResponse` 对象，该对象没有 `settimeout` 方法；keepalive 超时一直退化到 `urlopen` 的 120 秒默认值。现已通过 `response.fp.fp.raw._sock` 正确穿透到原始 socket，30 秒心跳正常发送，同时兼容 gzip 压缩包装链路
 - **修复 socket.settimeout OSError 未捕获** — 防止操作已被关闭的 socket 时抛异常
+- **改用队列+后台线程模式彻底解决 keepalive 问题** — 旧方案依赖 upstream socket 超时（`response.fp.fp.raw._sock`），该链路在不同 Python 版本/平台下内部结构不一致，keepalive 实际未生效。现改为 `_stream_completion` 中启动后台线程读取上游，主线程通过 `queue.get(timeout=25)` 定期发送 keepalive（SSE 注释 `: keepalive`），独立于上游 socket，25 秒间隔确保远低于各前端 45 秒 IDLE 超时限制
 ### 2026-06-26 — v0.2.2 修复推理模型流式超时 + keepalive 心跳
 
 - **修复 GLM 5.2 等推理模型流式请求 45 秒超时** — 推理模型思考阶段不产生任何输出，导致前端 idle-timeout；现在在 SSE 读取层添加 30 秒 keepalive 心跳（`: keepalive` SSE 注释），防止前端因长时间无数据而断开连接
