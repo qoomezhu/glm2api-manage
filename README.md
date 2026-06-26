@@ -9,7 +9,8 @@
 ### 2026-06-26 — v0.2.2 修复推理模型流式超时 + keepalive 心跳
 
 - **修复 GLM 5.2 等推理模型流式请求 45 秒超时** — 推理模型思考阶段不产生任何输出，导致前端 idle-timeout；现在在 SSE 读取层添加 30 秒 keepalive 心跳（`: keepalive` SSE 注释），防止前端因长时间无数据而断开连接
-- **修复流式请求中途报 `GLM part status error`** — GLM 的 SSE 流中，单个 part（如 reasoning 段）可能以 `status: "error"` 结束，但 event 级别状态仍为 `finish`，之前会错误地中断整个流，现在只在 event 级别确实为 error 时才中断
+- **流尾兜底，无论上游是否正常结束都送合法 OpenAI 流终止帧** — `_iter_sse_events` 退出后调用 `accumulator.finalize(status="stop")`，确保客户端在断连/IncompleteRead 等异常分支下也能收到 `choices[0].finish_reason="stop"` 与 `data: [DONE]\n\n`，避免解析错误
+- **收紧 `GLM part status error` 判定** — 单个 part（如 reasoning 段）以 `status: "error"` 结束不再立即 throw，必须 event 级别状态也是 `error` 才中断整轮（与 v0.2.1 修复一致，本次进一步细化为「event 级别 error 才 fatal」）
 
 ### 2026-06-26 — v0.2.1 修复流式响应中途报错
 
