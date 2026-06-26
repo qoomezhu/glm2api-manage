@@ -291,6 +291,15 @@ class GLMWebClient:
         if not isinstance(parts, list):
             return None
         event_status = str(event.get("status", "")).strip().lower()
+        # Only treat errors as fatal when the event-level status is explicitly
+        # "error".  GLM may mark individual parts (e.g. a reasoning segment)
+        # with status "error" while other parts and the overall event are still
+        # fine — especially during tool execution where parts finish at
+        # different times.  Treating empty or non-error event status as fatal
+        # caused the stream to be interrupted prematurely when GLM 5.2 called
+        # tools (e.g. file reading).
+        if event_status != "error":
+            return None
         # First pass: check for explicit error dicts in parts
         for part in parts:
             if not isinstance(part, dict):
@@ -298,18 +307,13 @@ class GLMWebClient:
             error = part.get("error")
             if isinstance(error, dict) and error:
                 return error
-        # Second pass: only treat part status "error" as fatal when the
-        # event-level status is also "error" (or absent).  GLM may mark
-        # individual parts (e.g. a reasoning segment) with status "error"
-        # when they finish or get interrupted, while other parts and the
-        # overall event are still fine.
-        if event_status in ("error", ""):
-            for part in parts:
-                if not isinstance(part, dict):
-                    continue
-                part_status = str(part.get("status", "")).strip().lower()
-                if part_status == "error":
-                    return {"message": "GLM part status error"}
+        # Second pass: check for part-level status "error"
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            part_status = str(part.get("status", "")).strip().lower()
+            if part_status == "error":
+                return {"message": "GLM part status error"}
         return None
 
     def delete_conversation(self, conversation_id: str, assistant_id: str | None = None) -> None:
@@ -711,11 +715,39 @@ class GLMWebClient:
         # Set a shorter socket timeout so we can send keepalive comments
         # to the client while waiting for the upstream to respond.
         # This prevents front-end idle-timeout errors (e.g. Open WebUI 45s).
-        sock = getattr(response, "fp", None)
+        #
+        # Access the underlying raw socket through the response chain:
+        #   addinfourl -> HTTPResponse -> BufferedReader -> SocketIO -> socket
+        # The urllib.response.addinfourl object's .fp is the HTTPResponse,
+        # which has .fp = sock.makefile("rb") — a BufferedReader wrapping SocketIO.
+        sock = None
+        try:
+            # Non-gzip: addinfourl.fp is HTTPResponse, HTTPResponse.fp is BufferedReader
+            if hasattr(response, "fp") and hasattr(response.fp, "fp"):
+                inner = response.fp.fp
+                if hasattr(inner, "raw") and hasattr(inner.raw, "_sock"):
+                    sock = inner.raw._sock
+                elif hasattr(inner, "_sock"):
+                    sock = inner._sock
+            # Gzip: response is BufferedReader(GzipFile(fileobj=urllib_response))
+            elif hasattr(response, "raw") and hasattr(response.raw, "fileobj"):
+                fileobj = response.raw.fileobj
+                if hasattr(fileobj, "fp") and hasattr(fileobj.fp, "fp"):
+                    inner = fileobj.fp.fp
+                    if hasattr(inner, "raw") and hasattr(inner.raw, "_sock"):
+                        sock = inner.raw._sock
+                    elif hasattr(inner, "_sock"):
+                        sock = inner._sock
+        except (AttributeError, TypeError, OSError):
+            sock = None
+
         original_timeout = None
         if sock is not None and hasattr(sock, "settimeout"):
-            original_timeout = sock.gettimeout()
-            sock.settimeout(KEEPALIVE_INTERVAL)
+            try:
+                original_timeout = sock.gettimeout()
+                sock.settimeout(KEEPALIVE_INTERVAL)
+            except OSError:
+                pass
 
         try:
             while True:
