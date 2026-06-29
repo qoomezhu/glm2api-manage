@@ -4,6 +4,7 @@ import json
 import re
 
 
+# 原生工具黑名单：模型内部记忆里可能存在的浏览器/搜索类工具，统一拒绝。
 BLOCKED_NATIVE_TOOL_NAMES = {
     "open",
     "open_url",
@@ -16,15 +17,21 @@ BLOCKED_NATIVE_TOOL_NAMES = {
     "browse",
     "open_link",
 }
+
+# 服务端原生工具集合：当前为空，保留扩展点。
+# 当 GLM 上游支持某些原生工具调用时（content type == "tool_calls"），可在此声明；
+# 这些工具不会注入到 DSML 提示词里，由服务端直接透传/执行。
 SERVER_SIDE_TOOL_NAMES: set[str] = set()
 
+# 规范的工具调用示例，使用普通 XML 标签（<dsml-tool-calls>），
+# 避免 <|...|> 这类标记被主流 LLM tokenizer 当作特殊 token 吞掉。
 CANONICAL_TOOL_CALL_EXAMPLE = "\n".join(
     [
-        "<|DSML|tool_calls>",
-        '  <|DSML|invoke name="TOOL_NAME">',
-        '    <|DSML|parameter name="actual_parameter_name"><![CDATA[value]]></|DSML|parameter>',
-        "  </|DSML|invoke>",
-        "</|DSML|tool_calls>",
+        "<dsml-tool-calls>",
+        '  <dsml-invoke name="TOOL_NAME">',
+        '    <dsml-parameter name="actual_parameter_name"><![CDATA[value]]></dsml-parameter>',
+        "  </dsml-invoke>",
+        "</dsml-tool-calls>",
     ]
 )
 
@@ -77,7 +84,7 @@ def _dsml_parameters_from_object(payload: object) -> str:
         parts: list[str] = []
         for key, value in payload.items():
             name = _xml_escape_text(_safe_parameter_name(key))
-            parts.append(f'<|DSML|parameter name="{name}">{_dsml_parameters_from_object(value)}</|DSML|parameter>')
+            parts.append(f'<dsml-parameter name="{name}">{_dsml_parameters_from_object(value)}</dsml-parameter>')
         return "".join(parts)
     if isinstance(payload, list):
         return "".join(f"<item>{_dsml_parameters_from_object(item)}</item>" for item in payload)
@@ -94,19 +101,19 @@ def serialize_tool_call_block(name: str, arguments: object) -> str:
     if not isinstance(parsed_arguments, dict):
         parsed_arguments = {"value": parsed_arguments}
     return (
-        "<|DSML|tool_calls>\n"
-        f'  <|DSML|invoke name="{_xml_escape_text(name)}">\n'
+        "<dsml-tool-calls>\n"
+        f'  <dsml-invoke name="{_xml_escape_text(name)}">\n'
         f"    {_dsml_parameters_from_object(parsed_arguments)}\n"
-        "  </|DSML|invoke>\n"
-        "</|DSML|tool_calls>"
+        "  </dsml-invoke>\n"
+        "</dsml-tool-calls>"
     )
 
 
 def serialize_tool_result_block(tool_call_id: object, tool_name: str, content: str) -> str:
     safe_content = content.replace("]]>", "]]]]><![CDATA[>")
     return (
-        f'<|DSML|tool_result call_id="{_xml_escape_text(str(tool_call_id or "unknown"))}" '
-        f'name="{_xml_escape_text(tool_name)}"><content><![CDATA[{safe_content}]]></content></|DSML|tool_result>'
+        f'<dsml-tool-result call_id="{_xml_escape_text(str(tool_call_id or "unknown"))}" '
+        f'name="{_xml_escape_text(tool_name)}"><content><![CDATA[{safe_content}]]></content></dsml-tool-result>'
     )
 
 
@@ -159,10 +166,10 @@ def build_tool_call_instructions(
                 CANONICAL_TOOL_CALL_EXAMPLE,
                 "The server will parse this DSML block back into standard OpenAI tool_calls.",
                 "Parameter rules:",
-                "- The root executable block must be <|DSML|tool_calls> and each call must be a <|DSML|invoke name=\"...\"> child.",
-                "- Each argument must be a <|DSML|parameter name=\"...\"> child of the invoke.",
+                "- The root executable block must be <dsml-tool-calls> and each call must be a <dsml-invoke name=\"...\"> child.",
+                "- Each argument must be a <dsml-parameter name=\"...\"> child of the invoke.",
                 "- Parameter names are case-sensitive and must exactly match the schema. For example, use `filePath` only when the schema says `filePath`; never change it to `filepath`, `file_path`, or `FilePath`.",
-                "- Encode nested objects with nested <|DSML|parameter name=\"...\"> tags.",
+                "- Encode nested objects with nested <dsml-parameter name=\"...\"> tags.",
                 "- Use repeated <item> tags to represent arrays.",
                 "- JSON literals are allowed as parameter values when the schema expects an object, array, number, boolean, or null.",
                 "- Prefer <![CDATA[...]]> for arbitrary strings.",
@@ -180,8 +187,8 @@ def build_tool_call_instructions(
             "- After receiving a tool result, answer the user directly from the result and do not repeat the earlier tool-call decision process.",
             "- For DSML tools, do not emit OpenAI JSON tool_calls arrays, function_call objects, or any non-DSML tool syntax.",
             "- Do not mix normal explanation text with executable DSML.",
-            "- Put multiple DSML invokes inside one <|DSML|tool_calls> root when you truly need multiple calls in one turn.",
-            "- After a <|DSML|tool_result ...> block, continue from that result and call another tool only when necessary.",
+            "- Put multiple DSML invokes inside one <dsml-tool-calls> root when you truly need multiple calls in one turn.",
+            "- After a <dsml-tool-result ...> block, continue from that result and call another tool only when necessary.",
         ]
     )
     if mode == "none":

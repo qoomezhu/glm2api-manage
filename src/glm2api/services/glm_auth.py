@@ -3,20 +3,23 @@ from __future__ import annotations
 import hashlib
 import gzip
 import json
+import os
 import random
 import threading
 import time
 import uuid
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging import Logger
 
-from ..config import AppConfig, GUEST_REFRESH_TOKEN_MARKER
-from ..logging_utils import debug_dump
+from ..config import AppConfig, DEFAULT_SIGN_SECRET, GUEST_REFRESH_TOKEN_MARKER
+from ..logging_utils import debug_dump, mask_sensitive_headers
 
 
-SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
+# 签名密钥：模块加载时先从真实环境变量读取一次（供 build_sign 在管理器构造前使用），
+# 之后 GLMAccessTokenManager.__init__ 会用 config.glm_sign_secret（已合并 .env）覆盖。
+SIGN_SECRET = os.environ.get("GLM_SIGN_SECRET") or DEFAULT_SIGN_SECRET
 ACCESS_TOKEN_EXPIRES_SECONDS = 3600
 
 
@@ -28,17 +31,6 @@ def build_sign() -> tuple[str, str, str]:
     nonce = uuid.uuid4().hex
     sign = hashlib.md5(f"{timestamp}-{nonce}-{SIGN_SECRET}".encode("utf-8")).hexdigest()
     return timestamp, nonce, sign
-
-
-def build_random_x_forwarded_for() -> str:
-    while True:
-        first_octet = random.randint(1, 223)
-        if first_octet in {10, 127, 169, 172, 192}:
-            continue
-        octets = [first_octet]
-        for _ in range(3):
-            octets.append(random.randint(0, 255))
-        return ".".join(str(octet) for octet in octets)
 
 
 @dataclass(slots=True)
@@ -53,12 +45,19 @@ class AccountState:
     refresh_token: str
     is_guest: bool = False
     cached_token: AccessToken | None = None
+    # 每个账号持有一个稳定的 device_id，所有请求复用同一个值，
+    # 避免每次请求都换 device_id（真实浏览器同一个会话不会频繁换设备指纹）。
+    device_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class GLMAccessTokenManager:
     def __init__(self, config: AppConfig, logger: Logger) -> None:
         self.config = config
         self.logger = logger
+        # 用 config（已合并 .env 与真实环境变量）覆盖模块级 SIGN_SECRET，
+        # 这样 build_sign() 在后续所有调用中都会使用配置中的密钥。
+        global SIGN_SECRET
+        SIGN_SECRET = config.glm_sign_secret
         self._accounts = [
             AccountState(
                 refresh_token="" if token == GUEST_REFRESH_TOKEN_MARKER else token,
@@ -75,7 +74,15 @@ class GLMAccessTokenManager:
             any(a.is_guest for a in self._accounts),
         )
 
-    def get_browser_headers(self, app_fr: str = "browser_extension") -> dict[str, str]:
+    def get_device_id(self, account_index: int) -> str:
+        with self._lock:
+            return self._accounts[account_index].device_id
+
+    def get_browser_headers(self, app_fr: str = "web") -> dict[str, str]:
+        # X-App-Fr 必须与 Origin 保持一致：Origin 是 https://chatglm.cn 且
+        # Sec-Fetch-Site 是 same-origin，说明伪装的是 chatglm.cn 网页端自身发起的请求，
+        # 因此 X-App-Fr 应取网页端取值（"web"），而不是 "browser_extension"
+        # （浏览器扩展的 Origin 应为 chrome-extension://...，与 chatglm.cn 矛盾）。
         return {
             "Accept": "application/json, text/plain, */*" if app_fr == "default" else "text/event-stream",
             "Accept-Encoding": "gzip, deflate" if app_fr == "default" else "identity",
@@ -99,7 +106,6 @@ class GLMAccessTokenManager:
             "X-Device-Brand": "",
             "X-Device-Model": "",
             "X-Lang": "zh",
-            "X-Forwarded-For": build_random_x_forwarded_for(),
         }
 
     def read_json_response(self, response) -> dict[str, object]:
@@ -183,14 +189,14 @@ class GLMAccessTokenManager:
             headers={
                 **self.get_browser_headers(),
                 "Authorization": f"Bearer {account.refresh_token}",
-                "X-Device-Id": uuid.uuid4().hex,
+                "X-Device-Id": account.device_id,
                 "X-Nonce": nonce,
                 "X-Request-Id": uuid.uuid4().hex,
                 "X-Sign": sign,
                 "X-Timestamp": timestamp,
             },
         )
-        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 刷新 access_token 请求头 account={account_index}", dict(request.header_items()))
+        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 刷新 access_token 请求头 account={account_index}", mask_sensitive_headers(dict(request.header_items())))
         debug_dump(self.logger, self.config.debug_dump_all, f"GLM 刷新 access_token 请求体 account={account_index}", b"{}")
         with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
             payload = self.read_json_response(response)
@@ -220,7 +226,6 @@ class GLMAccessTokenManager:
         account = self._accounts[account_index]
         timestamp, nonce, sign = build_sign()
         request_id = uuid.uuid4().hex
-        device_id = uuid.uuid4().hex
         request = urllib.request.Request(
             self.config.guest_refresh_url,
             data=b"",
@@ -229,14 +234,14 @@ class GLMAccessTokenManager:
                 **self.get_browser_headers(app_fr="default"),
                 "Content-Length": "0",
                 "Referer": "https://chatglm.cn/",
-                "X-Device-Id": device_id,
+                "X-Device-Id": account.device_id,
                 "X-Nonce": nonce,
                 "X-Request-Id": request_id,
                 "X-Sign": sign,
                 "X-Timestamp": timestamp,
             },
         )
-        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求头 account={account_index}", dict(request.header_items()))
+        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求头 account={account_index}", mask_sensitive_headers(dict(request.header_items())))
         debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求体 account={account_index}", b"")
         with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
             payload = self.read_json_response(response)
@@ -275,31 +280,50 @@ class GLMAccessTokenManager:
             self.logger.warning(".env 文件不存在，无法自动写回新的 refresh_token")
             return
 
+        # 跨进程文件锁：防止多实例并发写回 .env 造成内容覆盖。
+        # 单实例时 _persist_lock（threading.Lock）已保证线程安全，
+        # 这里再加 OS 级锁兜底多进程场景。Windows 无 fcntl，回退到仅线程锁。
+        lock_path = env_path.parent / ".env.lock"
+        lock_fh = open(lock_path, "w")
         try:
-            content = env_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise RuntimeError(f".env 不是有效的 UTF-8 编码: {env_path}") from exc
-        except OSError as exc:
-            raise RuntimeError(f"读取 .env 失败: {env_path} error={exc}") from exc
-        lines = content.splitlines()
-        updated = False
+            try:
+                import fcntl
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            except ImportError:
+                pass  # Windows: fcntl 不可用，依赖 threading.Lock
 
-        for index, line in enumerate(lines):
-            if line.startswith("GLM_REFRESH_TOKEN="):
-                lines[index] = f"GLM_REFRESH_TOKEN={refresh_token}"
-                updated = True
-                break
+            try:
+                content = env_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError(f".env 不是有效的 UTF-8 编码: {env_path}") from exc
+            except OSError as exc:
+                raise RuntimeError(f"读取 .env 失败: {env_path} error={exc}") from exc
+            lines = content.splitlines()
+            updated = False
 
-        if not updated:
-            if lines and lines[-1].strip():
-                lines.append("")
-            lines.append(f"GLM_REFRESH_TOKEN={refresh_token}")
+            for index, line in enumerate(lines):
+                if line.startswith("GLM_REFRESH_TOKEN="):
+                    lines[index] = f"GLM_REFRESH_TOKEN={refresh_token}"
+                    updated = True
+                    break
 
-        new_content = "\n".join(lines) + "\n"
-        try:
-            env_path.write_text(new_content, encoding="utf-8")
-        except OSError as exc:
-            raise RuntimeError(f"写入 .env 失败: {env_path} error={exc}") from exc
+            if not updated:
+                if lines and lines[-1].strip():
+                    lines.append("")
+                lines.append(f"GLM_REFRESH_TOKEN={refresh_token}")
+
+            new_content = "\n".join(lines) + "\n"
+            try:
+                env_path.write_text(new_content, encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(f"写入 .env 失败: {env_path} error={exc}") from exc
+        finally:
+            try:
+                import fcntl
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except ImportError:
+                pass
+            lock_fh.close()
 
     def should_switch_account(self, exc: Exception) -> bool:
         if hasattr(exc, "status_code"):

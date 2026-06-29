@@ -46,15 +46,15 @@ def test_convert_messages_injects_xml_tool_prompt_and_history():
 
     prompt = converted[0]["content"][0]["text"]
 
-    assert "<|DSML|tool_calls>" in prompt
-    assert "<|DSML|invoke name=\"get_weather\">" in prompt
-    assert "<|DSML|tool_result call_id=\"call_1\" name=\"get_weather\">" in prompt
+    assert "<dsml-tool-calls>" in prompt
+    assert "<dsml-invoke name=\"get_weather\">" in prompt
+    assert "<dsml-tool-result call_id=\"call_1\" name=\"get_weather\">" in prompt
     assert "<ml_tool_calls>" not in prompt
     assert "# TOOL USE PROTOCOL" in prompt
     assert "Use the DSML format below exactly." in prompt
     assert "The server will parse this DSML block back into standard OpenAI tool_calls." in prompt
-    assert "<|DSML|parameter name=\"actual_parameter_name\"><![CDATA[value]]></|DSML|parameter>" in prompt
-    assert "Each argument must be a <|DSML|parameter name=\"...\"> child of the invoke." in prompt
+    assert "<dsml-parameter name=\"actual_parameter_name\"><![CDATA[value]]></dsml-parameter>" in prompt
+    assert "Each argument must be a <dsml-parameter name=\"...\"> child of the invoke." in prompt
     assert "Parameter names are case-sensitive and must exactly match the schema." in prompt
     assert "never change it to `filepath`, `file_path`, or `FilePath`." in prompt
     assert "# BLOCKED TOOLS" not in prompt
@@ -72,9 +72,9 @@ def test_accumulator_build_response_maps_xml_to_openai_tool_calls():
                     "content": [
                         {
                             "type": "text",
-                            "text": "<|DSML|tool_calls><|DSML|invoke name=\"get_weather\">"
-                            "<|DSML|parameter name=\"city\">上海</|DSML|parameter>"
-                            "</|DSML|invoke></|DSML|tool_calls>",
+                            "text": "<dsml-tool-calls><dsml-invoke name=\"get_weather\">"
+                            "<dsml-parameter name=\"city\">上海</dsml-parameter>"
+                            "</dsml-invoke></dsml-tool-calls>",
                         }
                     ],
                 }
@@ -103,10 +103,10 @@ def test_accumulator_streaming_tool_call_emits_assistant_role_before_tool_delta(
                     "content": [
                         {
                             "type": "text",
-                            "text": "<|DSML|tool_calls><|DSML|invoke name=\"write\">"
-                            "<|DSML|parameter name=\"filePath\">test.txt</|DSML|parameter>"
-                            "<|DSML|parameter name=\"content\"></|DSML|parameter>"
-                            "</|DSML|invoke></|DSML|tool_calls>",
+                            "text": "<dsml-tool-calls><dsml-invoke name=\"write\">"
+                            "<dsml-parameter name=\"filePath\">test.txt</dsml-parameter>"
+                            "<dsml-parameter name=\"content\"></dsml-parameter>"
+                            "</dsml-invoke></dsml-tool-calls>",
                         }
                     ],
                 }
@@ -135,10 +135,10 @@ def test_accumulator_streaming_extracts_tool_call_from_reasoning_fallback():
                         {
                             "type": "think",
                             "think": "I should call the tool.\n"
-                            "<|DSML|tool_calls><|DSML|invoke name=\"write\">"
-                            "<|DSML|parameter name=\"filePath\">test.txt</|DSML|parameter>"
-                            "<|DSML|parameter name=\"content\"></|DSML|parameter>"
-                            "</|DSML|invoke></|DSML|tool_calls>",
+                            "<dsml-tool-calls><dsml-invoke name=\"write\">"
+                            "<dsml-parameter name=\"filePath\">test.txt</dsml-parameter>"
+                            "<dsml-parameter name=\"content\"></dsml-parameter>"
+                            "</dsml-invoke></dsml-tool-calls>",
                         }
                     ],
                 }
@@ -166,10 +166,10 @@ def test_accumulator_build_response_extracts_tool_call_from_reasoning_fallback()
                     "content": [
                         {
                             "type": "think",
-                            "think": "<|DSML|tool_calls><|DSML|invoke name=\"write\">"
-                            "<|DSML|parameter name=\"filePath\">test.txt</|DSML|parameter>"
-                            "<|DSML|parameter name=\"content\"></|DSML|parameter>"
-                            "</|DSML|invoke></|DSML|tool_calls>",
+                            "think": "<dsml-tool-calls><dsml-invoke name=\"write\">"
+                            "<dsml-parameter name=\"filePath\">test.txt</dsml-parameter>"
+                            "<dsml-parameter name=\"content\"></dsml-parameter>"
+                            "</dsml-invoke></dsml-tool-calls>",
                         }
                     ],
                 }
@@ -186,74 +186,33 @@ def test_accumulator_build_response_extracts_tool_call_from_reasoning_fallback()
     assert message["tool_calls"][0]["function"]["arguments"] == '{"filePath":"test.txt","content":""}'
 
 
-def test_sanitize_shell_command_argument_from_json_string():
+def test_sanitize_shell_command_passes_through_unchanged():
+    # shell 工具的 command 不再做 powershell 硬编码重写，原样透传。
     cleaned = sanitize_tool_call_payload(
         "shell",
         {
-            "command": '["powershell.exe","-Command","Get-ChildItem -Force"]',
+            "command": ["git", "status", "--short"],
             "workdir": "E:\\Projects\\2api\\glm2api",
         },
     )
 
     assert cleaned == {
-        "command": ["powershell.exe", "-Command", "Get-ChildItem -Force"],
+        "command": ["git", "status", "--short"],
         "workdir": "E:\\Projects\\2api\\glm2api",
     }
 
 
-def test_sanitize_shell_command_argument_from_quoted_sequence():
+def test_sanitize_shell_command_string_passes_through():
+    # 字符串形式的 command 也不再被解析/包装，原样保留。
     cleaned = sanitize_tool_call_payload(
         "shell",
-        {
-            "command": '"powershell.exe", "-Command", "Get-ChildItem -Force"',
-        },
+        {"command": "Get-ChildItem"},
     )
 
-    assert cleaned == {
-        "command": ["powershell.exe", "-Command", "Get-ChildItem -Force"],
-    }
+    assert cleaned == {"command": "Get-ChildItem"}
 
 
-def test_sanitize_shell_command_argument_from_plain_string():
-    cleaned = sanitize_tool_call_payload(
-        "shell",
-        {
-            "command": "Get-ChildItem",
-        },
-    )
-
-    assert cleaned == {
-        "command": ["powershell.exe", "-Command", "Get-ChildItem"],
-    }
-
-
-def test_sanitize_shell_command_argument_wraps_powershell_cmdlet_array():
-    cleaned = sanitize_tool_call_payload(
-        "shell",
-        {
-            "command": ["Get-ChildItem", "-Recurse", "-Filter", "*.txt"],
-        },
-    )
-
-    assert cleaned == {
-        "command": ["powershell.exe", "-Command", "Get-ChildItem -Recurse -Filter *.txt"],
-    }
-
-
-def test_sanitize_shell_command_argument_keeps_native_executable_array():
-    cleaned = sanitize_tool_call_payload(
-        "shell",
-        {
-            "command": ["git", "status", "--short"],
-        },
-    )
-
-    assert cleaned == {
-        "command": ["git", "status", "--short"],
-    }
-
-
-def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
+def test_accumulator_streams_preamble_and_emits_tool_call():
     accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"shell"})
     chunks, status = accumulator.consume_event(
         {
@@ -266,9 +225,11 @@ def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
                         {
                             "type": "text",
                             "text": "我将创建文件。\n\n"
-                            '<|DSML|tool_calls><|DSML|invoke name="shell">'
-                            '<|DSML|parameter name="command"><![CDATA[["powershell.exe", "-Command", "pwd"]]></|DSML|parameter>'
-                            "</|DSML|invoke></|DSML|tool_calls>",
+                            "<dsml-tool-calls>\n"
+                            '  <dsml-invoke name="shell">\n'
+                            '    <dsml-parameter name="command"><![CDATA[["powershell.exe", "-Command", "pwd"]]]></dsml-parameter>\n'
+                            "  </dsml-invoke>\n"
+                            "</dsml-tool-calls>",
                         }
                     ],
                 }
@@ -278,13 +239,15 @@ def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
 
     final_chunks = accumulator.finalize(status)
 
-    assert chunks == []
-    assert "我将创建文件" not in "".join(final_chunks)
-    assert '"tool_calls"' in final_chunks[1]
-    assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[1]
+    # 工具可用时，前导可见文本应直接流式输出（不再缓存到 finalize）
+    assert chunks != []
+    assert "我将创建文件" in "".join(chunks)
+    # finalize 应输出工具调用
+    assert any('"tool_calls"' in chunk for chunk in final_chunks)
+    assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in "".join(final_chunks)
 
 
-def test_accumulator_defers_visible_text_when_tools_available():
+def test_accumulator_streams_visible_text_when_tools_available():
     accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"shell"})
     chunks, status = accumulator.consume_event(
         {
@@ -301,9 +264,10 @@ def test_accumulator_defers_visible_text_when_tools_available():
 
     final_chunks = accumulator.finalize(status)
 
-    assert chunks == []
-    assert '"content":"你好"' in final_chunks[0]
-    assert '"finish_reason":"stop"' in final_chunks[1]
+    # 工具可用时，可见文本直接流式输出（不再缓存到 finalize）
+    assert chunks != []
+    assert '"content":"你好"' in "".join(chunks)
+    assert '"finish_reason":"stop"' in "".join(final_chunks)
 
 
 def test_accumulator_reports_unavailable_dsml_tool_instead_of_empty_response():
@@ -318,9 +282,11 @@ def test_accumulator_reports_unavailable_dsml_tool_instead_of_empty_response():
                     "content": [
                         {
                             "type": "text",
-                            "text": '<|DSML|tool_calls><|DSML|invoke name="search">'
-                            '<|DSML|parameter name="search_query"><![CDATA[{"q":"阿房宫赋","recency":365}]></|DSML|parameter>'
-                            "</|DSML|invoke></|DSML|tool_calls>",
+                            "text": "<dsml-tool-calls>\n"
+                            '  <dsml-invoke name="search">\n'
+                            '    <dsml-parameter name="search_query"><![CDATA[{"q":"阿房宫赋","recency":365}]]></dsml-parameter>\n'
+                            "  </dsml-invoke>\n"
+                            "</dsml-tool-calls>",
                         }
                     ],
                 }
@@ -330,10 +296,10 @@ def test_accumulator_reports_unavailable_dsml_tool_instead_of_empty_response():
 
     final_chunks = accumulator.finalize(status)
 
-    assert chunks == []
-    assert "未声明工具" in final_chunks[0]
-    assert "`search`" in final_chunks[0]
-    assert '"finish_reason":"stop"' in final_chunks[1]
+    # 工具名不在白名单时，parser 不会产出 tool_calls，finalize 走兜底检测未声明工具
+    assert any("未声明工具" in chunk for chunk in final_chunks)
+    assert any("`search`" in chunk for chunk in final_chunks)
+    assert '"finish_reason":"stop"' in "".join(final_chunks)
 
 
 def test_convert_messages_respects_tool_choice_none_and_specific():
@@ -488,10 +454,12 @@ def test_convert_messages_repairs_cherry_fetch_url_and_skips_invalid_tool_error_
     prompt = converted[0]["content"][0]["text"]
 
     assert (
-        "<|DSML|parameter name=\"url\"><![CDATA[https://opendata.baidu.com/api.php?query=1.1.1.1&co=&resource_id=6006&oe=utf8]]></|DSML|parameter>"
+        "<dsml-parameter name=\"url\"><![CDATA[https://opendata.baidu.com/api.php?query=1.1.1.1&co=&resource_id=6006&oe=utf8]]></dsml-parameter>"
         in prompt
     )
-    assert "expected string, received undefined" not in prompt
+    # task 14: tool 结果始终保留（即使对应 assistant tool_call 被修复），
+    # 错误信息作为上下文保留给模型，不再丢弃。
+    assert "expected string, received undefined" in prompt
 
 
 def test_accumulator_repairs_param_name_only_tool_call_with_fallback_url():

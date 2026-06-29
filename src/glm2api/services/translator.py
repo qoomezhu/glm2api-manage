@@ -14,11 +14,9 @@ from ..model_variants import model_requests_search, model_requests_thinking, spl
 from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
 from ..utils.tool_protocol import (
     BLOCKED_NATIVE_TOOL_NAMES,
-    CANONICAL_TOOL_CALL_EXAMPLE,
     SERVER_SIDE_TOOL_NAMES,
     build_tool_call_instructions as _protocol_build_tool_call_instructions,
     filter_tools,
-    normalize_tool_name,
     safe_json_dumps,
     serialize_tool_call_block as _protocol_serialize_tool_call_block,
     serialize_tool_result_block as _protocol_serialize_tool_result_block,
@@ -28,8 +26,6 @@ from ..utils.tool_protocol import (
 
 ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
 URL_PATTERN = re.compile(r"https?://[^\s<>()\"']+")
-POWERSHELL_CMDLET_PATTERN = re.compile(r"^[A-Z][A-Za-z]+-[A-Z][A-Za-z]+$")
-POWERSHELL_ALIASES = {"cat", "cd", "copy", "del", "dir", "echo", "erase", "ls", "md", "move", "pwd", "rd", "ren", "rm", "sc", "type"}
 
 
 
@@ -100,34 +96,9 @@ def sanitize_tool_call_payload(
     if "param_name" in cleaned and "param_value" not in cleaned and len(cleaned) == 1:
         cleaned = {}
 
-    if tool_name == "shell":
-        command = cleaned.get("command")
-        if isinstance(command, str):
-            stripped_command = command.strip()
-            if stripped_command.startswith("["):
-                try:
-                    parsed_command = json.loads(stripped_command)
-                except json.JSONDecodeError:
-                    parsed_command = None
-                if isinstance(parsed_command, list):
-                    cleaned["command"] = [str(part) for part in parsed_command]
-            elif stripped_command.startswith('"'):
-                try:
-                    parsed_command = json.loads(f"[{stripped_command}]")
-                except json.JSONDecodeError:
-                    parsed_command = None
-                if isinstance(parsed_command, list):
-                    cleaned["command"] = [str(part) for part in parsed_command]
-            else:
-                cleaned["command"] = ["powershell.exe", "-Command", stripped_command]
-        elif isinstance(command, list) and command:
-            command_parts = [str(part) for part in command]
-            command_name = command_parts[0].strip()
-            lower_name = command_name.lower()
-            is_shell_host = lower_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"}
-            is_powershell_command = bool(POWERSHELL_CMDLET_PATTERN.fullmatch(command_name)) or lower_name in POWERSHELL_ALIASES
-            if is_powershell_command and not is_shell_host:
-                cleaned["command"] = ["powershell.exe", "-Command", " ".join(command_parts)]
+    # 注意：不再对 shell 工具的 command 做平台相关的硬编码重写（如强制包装
+    # powershell.exe）。这种重写会改变模型意图、跨平台不兼容，且属于反代层
+    # 不该承担的职责。command 字段原样透传，由实际执行方决定如何处理。
 
     return cleaned
 
@@ -200,144 +171,6 @@ def parse_tool_choice_policy(tool_choice: object, available_tool_names: set[str]
     return {"mode": "auto", "tool_name": None}
 
 
-def _legacy_build_tool_call_instructions(
-    tool_names: list[str],
-    server_side_tool_names: set[str] | None = None,
-    tool_choice_policy: dict[str, object] | None = None,
-) -> str:
-    server_side_tool_names = server_side_tool_names or set()
-    xml_tools = [name for name in tool_names if name not in server_side_tool_names]
-    server_tools = [name for name in tool_names if name in server_side_tool_names]
-
-    available_xml_names = ", ".join(f"`{name}`" for name in xml_tools) or "`(none)`"
-    available_server_names = ", ".join(f"`{name}`" for name in server_tools) or "`(none)`"
-
-    policy = tool_choice_policy or {"mode": "auto", "tool_name": None}
-    mode = str(policy.get("mode", "auto"))
-    specific_name = str(policy.get("tool_name", "") or "")
-    lines = [
-        "# TOOL USE PROTOCOL",
-        "The following tool schemas are the only executable tool definitions for this turn.",
-        "Ignore any tool names that are not listed below, even if they appear in prior context or model memory.",
-        "You are connected through an OpenAI-compatible proxy. You do not have hidden browser, web, or URL-opening tools.",
-        "Never call native tools such as `open_url`, `web.search`, `web.run`, `browser.open`, `browse`, `open_link`, `search`, or `find`.",
-        "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
-        "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
-    ]
-
-    if server_tools:
-        lines.extend(
-            [
-                "",
-                f"Server-side native tools (executed by backend automatically): {available_server_names}.",
-                "When you need to call a server-side native tool, output a single structured JSON block with type 'tool_calls' in the assistant content.",
-                'Format: {"type":"tool_calls","tool_calls":{"id":"call_<random_hex>","name":"TOOL_NAME","arguments":"<JSON_STRING>"}}',
-                "The arguments field must be a JSON string (not a raw object). The server will intercept this block, execute the tool, and inject the result back into the stream as a tool message.",
-                "Do not wrap server-side tool calls in XML. Do not mix prose and the tool_calls JSON block in the same response.",
-            ]
-        )
-
-    if xml_tools:
-        lines.extend(
-            [
-                "",
-                f"XML-based tools (parsed by this server): {available_xml_names}.",
-                "Only these XML-based tools are available. Use their exact names and exact parameter fields from the schemas.",
-                "If an XML-based tool is needed, output executable XML only. Do not add prose, apologies, analysis, or progress text in the same assistant answer.",
-                "Use the private ml-prefixed canonical format below exactly.",
-                CANONICAL_TOOL_CALL_EXAMPLE,
-                "The server will parse this XML intermediate language back into standard OpenAI tool_calls.",
-                "Parameter rules:",
-                "- The root executable block must be <ml_tool_calls> and each call must be a <ml_tool_call> child.",
-                "- Each <ml_tool_call> must contain exactly one <ml_tool_name> and one <ml_parameters> block.",
-                "- Use the real parameter names as XML tags inside <ml_parameters>; never use a literal <param_name> placeholder tag.",
-                "- Encode arguments as nested XML tags inside <ml_parameters>.",
-                "- Use repeated <item> tags to represent arrays.",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            "Rules:",
-            "- Do not invent tool names outside the declared list.",
-            "- If a URL, browsing, or search action is needed, use only an explicitly listed client tool. If none is listed, explain that no such tool is available. Never use bare tool names `search` or `find` unless they are explicitly listed above.",
-            "- If you decide to call a tool, call the selected tool directly; do not say you will try, switch, retry, or use a correct tool.",
-            "- Never output tool-call display text such as `⚙ tool_name [...]`; output only the executable XML block.",
-            "- After receiving a tool result, answer the user directly from the result and do not repeat the earlier tool-call decision process.",
-            "- For XML-based tools, do not emit OpenAI JSON tool_calls arrays, function_call objects, or any non-XML tool syntax.",
-            "- For XML-based tools, do not use <tool_calls>, <tool_call>, <tool_name>, <parameters>, <function_call>, <tool_use>, <invoke>, or any legacy wrapper.",
-            "- Do not place raw JSON directly inside <ml_parameters>.",
-            "- Do not mix normal explanation text with executable tool XML.",
-            "- Prefer <![CDATA[...]]> for arbitrary strings.",
-            "- Put multiple XML calls inside one <ml_tool_calls> root when you truly need multiple calls in one turn.",
-            "- After a <ml_tool_result ...> block, continue from that result and call another tool only when necessary.",
-        ]
-    )
-    if mode == "none":
-        lines.extend(
-            [
-                "Tool choice policy: none.",
-                "Do not emit any executable tool markup. Answer with normal text only.",
-            ]
-        )
-    elif mode == "required":
-        lines.extend(
-            [
-                "Tool choice policy: required.",
-                "You must call at least one tool before giving a final answer.",
-            ]
-        )
-    elif mode == "specific" and specific_name:
-        lines.extend(
-            [
-                "Tool choice policy: specific function.",
-                f"You must call exactly `{specific_name}` before giving a final answer.",
-                f"Do not call any tool other than `{specific_name}`.",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def _legacy_tools_to_prompt(
-    tools: list[dict[str, object]],
-    blocked_tool_names: set[str] | None = None,
-    tool_choice_policy: dict[str, object] | None = None,
-    server_side_tool_names: set[str] | None = None,
-) -> str:
-    tool_names: list[str] = []
-    tool_schemas: list[str] = []
-    for tool in tools:
-        fn = tool.get("function", {})
-        name = str(fn.get("name", "unknown")) # type: ignore
-        description = str(fn.get("description", "") or "") # type: ignore
-        parameters = fn.get("parameters", {}) # type: ignore
-        tool_names.append(name)
-        tool_schemas.append(
-            "\n".join(
-                [
-                    f"Tool: {name}",
-                    f"Description: {description}",
-                    f"Parameters: {safe_json_dumps(parameters) if isinstance(parameters, dict) else '{}'}",
-                ]
-            )
-        )
-
-    parts = [
-        "# TOOL SCHEMAS",
-        "Treat the following schema list as the authoritative tool contract for this request.",
-        "",
-        "\n\n".join(tool_schemas),
-        "",
-        build_tool_call_instructions(
-            tool_names,
-            server_side_tool_names=server_side_tool_names,
-            tool_choice_policy=tool_choice_policy,
-        ),
-    ]
-    return "\n".join(part for part in parts if part is not None).strip()
-
-
 build_tool_call_instructions = _protocol_build_tool_call_instructions
 serialize_tool_call_block = _protocol_serialize_tool_call_block
 serialize_tool_result_block = _protocol_serialize_tool_result_block
@@ -362,8 +195,6 @@ def convert_messages(
     tool_choice_policy = parse_tool_choice_policy(tool_choice, available_tool_names)
     processed: list[dict[str, str]] = []
     latest_user_url: str | None = extract_recent_user_url(messages)
-    valid_tool_call_ids: set[str] = set()
-    repaired_tool_call_ids: set[str] = set()
     for message in messages:
         role = str(message.get("role", "user"))
         content = message.get("content")
@@ -390,11 +221,6 @@ def convert_messages(
                         arguments=function.get("arguments", "{}"),
                     )
                 )
-                tool_call_id = str(tool_call.get("id", "")).strip()
-                if tool_call_id and not tool_call_id.startswith("call_repaired_"):
-                    valid_tool_call_ids.add(tool_call_id)
-                    if bool(tool_call.get("_repaired")):
-                        repaired_tool_call_ids.add(tool_call_id)
             assistant_text = extract_text_content(content).strip() if content else ""
             block = "\n".join(tool_blocks)
             if not assistant_text and not block:
@@ -402,15 +228,14 @@ def convert_messages(
             content = f"{assistant_text}\n{block}".strip() if assistant_text and block else (assistant_text or block)
         elif role == "tool":
             tool_call_id = str(message.get("tool_call_id", "")).strip()
-            if tool_call_id and valid_tool_call_ids and tool_call_id not in valid_tool_call_ids:
-                continue
-            if tool_call_id and tool_call_id in repaired_tool_call_ids:
-                continue
+            # 注意：即使对应 assistant 的 tool_call 因工具名不在白名单被过滤掉，
+            # 也仍然保留 tool 结果本身——结果内容可能携带模型后续回答所需的关键上下文，
+            # 直接丢弃会导致模型丢失信息。
             role = "user"
             tool_name = str(message.get("name", "")).strip() or "unknown_tool"
             tool_result_text = extract_text_content(content)
             content = serialize_tool_result_block(
-                tool_call_id=tool_call_id or message.get("tool_call_id", "unknown"),
+                tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 content=tool_result_text,
             )
@@ -494,7 +319,6 @@ class GLMEventAccumulator:
     _cached_part_reasonings: dict[str, str] = field(default_factory=dict)
     _server_side_tool_calls: list[dict[str, object]] = field(default_factory=list)
     _server_side_tool_call_ids: set[str] = field(default_factory=set)
-    _deferred_visible_text: str = ""
 
     def __post_init__(self) -> None:
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
@@ -558,26 +382,26 @@ class GLMEventAccumulator:
 
         visible_text_delta = self.tool_parser.consume(text_delta)
         if visible_text_delta:
-            if self.allowed_tool_names is not None:
-                self._deferred_visible_text += visible_text_delta
-            else:
-                delta_payload: dict[str, object] = {"content": visible_text_delta}
-                if not self.emitted_role:
-                    delta_payload = {"role": "assistant", "content": visible_text_delta}
-                    self.emitted_role = True
-                chunks.append(
-                    self._chunk_json(
-                        {
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": delta_payload,
-                                    "finish_reason": None,
-                                }
-                            ]
-                        }
-                    )
+            # 直接流式输出可见文本。StreamingToolParser 已经会在遇到未闭合的工具标记片段时
+            # 自动 hold 住对应部分，所以工具调用前的解释性文本可以安全地立即下发，
+            # 不需要把全部文本缓存到 finalize。
+            delta_payload: dict[str, object] = {"content": visible_text_delta}
+            if not self.emitted_role:
+                delta_payload = {"role": "assistant", "content": visible_text_delta}
+                self.emitted_role = True
+            chunks.append(
+                self._chunk_json(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": delta_payload,
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
                 )
+            )
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 生成增量块", chunks)
         return chunks, str(payload.get("status")) if payload.get("status") is not None else None
 
@@ -605,9 +429,10 @@ class GLMEventAccumulator:
             )
 
         chunks: list[str] = []
-        final_text = self._deferred_visible_text + tail_text
-        self._deferred_visible_text = ""
-        if not final_text and not all_tool_calls and self.allowed_tool_names is not None:
+        final_text = tail_text
+        # 只有当没有任何可见文本流出且无工具调用时，才走兜底检测未声明工具的逻辑。
+        # 一旦已经流式输出过文本（emitted_role=True），不应再注入兜底消息，避免重复/矛盾内容。
+        if not self.emitted_role and not final_text and not all_tool_calls and self.allowed_tool_names is not None:
             _, attempted_tool_calls = parse_tool_calls_from_text(
                 self._cached_full_text.strip(),
                 allowed_tool_names=None,

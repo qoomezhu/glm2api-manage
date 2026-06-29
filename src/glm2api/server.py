@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import queue
 import socket
@@ -12,7 +13,7 @@ from logging import Logger
 from urllib.parse import urlparse
 
 from .config import AppConfig
-from .logging_utils import debug_dump
+from .logging_utils import debug_dump, mask_sensitive_headers
 from .admin import (
     ApiKeyStore,
     RequestLogStore,
@@ -48,6 +49,16 @@ from .services.responses_adapter import (
 
 _CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)
 RESPONSES_STREAM_HEARTBEAT_SECONDS = 5.0
+
+
+def _constant_time_in(token: str, candidates: list[str]) -> bool:
+    """对列表中的每个候选 key 做恒定时间比较，避免时序侧信道枚举 key。"""
+    matched = False
+    for candidate in candidates:
+        if hmac.compare_digest(candidate, token):
+            matched = True
+    return matched
+
 
 # MIME types for static files
 _STATIC_MIME: dict[str, str] = {
@@ -124,7 +135,7 @@ class GLM2APIServer:
         request_store = RequestLogStore()
 
         class RequestHandler(BaseHTTPRequestHandler):
-            server_version = "glm2api/0.1.0"
+            server_version = "glm2api/0.2.3"
             protocol_version = "HTTP/1.1"
 
             # Admin integration attributes
@@ -404,8 +415,37 @@ class GLM2APIServer:
                 self.send_header("Connection", "close")
                 self.end_headers()
 
+                # Use a queue + heartbeat thread so we can emit keepalive
+                # comments during long upstream "thinking" pauses, consistent
+                # with _stream_responses and _stream_completion.
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_upstream() -> None:
+                    try:
+                        for upstream_chunk in stream_iter:
+                            chunk_queue.put(upstream_chunk)
+                    except BaseException as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
                 try:
-                    for chunk in stream_iter:
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=RESPONSES_STREAM_HEARTBEAT_SECONDS)
+                        except queue.Empty:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            continue
+
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+                        chunk = queued
                         if not chunk:
                             continue
                         if not accumulator.started:
@@ -592,10 +632,10 @@ class GLM2APIServer:
                     authorization = self.headers.get("Authorization", "")
                     if authorization.startswith("Bearer "):
                         token = authorization[7:].strip()
-                        if token in config.server_api_keys:
+                        if _constant_time_in(token, config.server_api_keys):
                             return True
                     x_api_key = self.headers.get("x-api-key", "")
-                    if x_api_key and x_api_key.strip() in config.server_api_keys:
+                    if x_api_key and _constant_time_in(x_api_key.strip(), config.server_api_keys):
                         return True
 
                 # Check structured API key store
@@ -672,7 +712,7 @@ class GLM2APIServer:
                     logger,
                     config.debug_dump_all,
                     f"HTTP 入站请求 {self.command} {self.path} headers",
-                    {key: value for key, value in self.headers.items()},
+                    mask_sensitive_headers({key: value for key, value in self.headers.items()}),
                 )
 
             def _path_without_query(self) -> str:

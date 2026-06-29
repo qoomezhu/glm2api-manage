@@ -10,57 +10,47 @@ from .tool_protocol import BLOCKED_NATIVE_TOOL_NAMES
 
 CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
 TOOL_RESULT_PATTERN = re.compile(
-    r"<(?:(?:\|DSML\|)|ml_)?tool_result\b[\s\S]*?</(?:(?:\|DSML\|)|ml_)?tool_result>",
+    r"<(?:dsml-tool_result|dsml-toolresult|ml_tool_result|tool_result)\b[\s\S]*?</(?:dsml-tool_result|dsml-toolresult|ml_tool_result|tool_result)>",
     re.IGNORECASE,
 )
+# 标准标签 dsml-tool-calls / dsml-tool_call；
+# 兼容历史 ml_tool_calls / ml_tool_call / tool_calls / tool_call。
 START_TAG_PATTERN = re.compile(
-    r"<(?P<tag>\|DSML\|tool_calls|tool_calls|ml_tool_calls|ml_tool_call)\b[^>]*>",
+    r"<(?P<tag>dsml-tool[-_]?calls|dsml-tool[-_]?call|ml_tool_calls|ml_tool_call|tool_calls|tool_call)\b[^>]*>",
     re.IGNORECASE,
 )
-DSML_TAG_PATTERN = re.compile(r"</?\|DSML\|(?P<name>tool_calls|invoke|parameter|tool_result)\b", re.IGNORECASE)
-DSML_OPEN_TAG_PATTERN = re.compile(
-    r"<\|dsml\|(?P<name>tool_calls|toolcalls|invoke|parameter|tool_result|toolresult)\b(?P<attrs>[^<>]*?)>",
-    re.IGNORECASE,
-)
-DSML_CLOSE_TAG_PATTERN = re.compile(
-    r"</\|dsml\|(?P<name>tool_calls|toolcalls|invoke|parameter|tool_result|toolresult)\s*\|?\s*>",
-    re.IGNORECASE,
-)
-DSML_COMPACT_CLOSE_TAG_PATTERN = re.compile(
-    r"(?:</\|dsml|<\|/dsml)(?P<name>toolcalls|invoke|parameter|toolresult)\s*\|\s*>",
-    re.IGNORECASE,
-)
-DSML_DOUBLE_PIPE_CLOSE_TAG_PATTERN = re.compile(
-    r"<\|\|dsml\|(?P<name>tool_calls|toolcalls|invoke|parameter|tool_result|toolresult)\s*\|?\s*>",
-    re.IGNORECASE,
-)
-DSML_TOOL_CALLS_CLOSE_PATTERN = re.compile(
-    r"(?:</\|dsml\|tool_calls\s*>|</\|dsml\|tool_calls\s*\|\s*>|</\|dsmltool_?calls\s*\|\s*>|<\|/dsmltool_?calls\s*\|\s*>)",
-    re.IGNORECASE,
-)
-DSML_TOOL_CALLS_TRAILING_CLOSE_PATTERN = re.compile(
-    r"(?:</\|dsml\|tool_calls\s*>|</\|dsml\|tool_calls\s*\|\s*>|</\|dsmltool_?calls\s*\|\s*>|<\|/dsmltool_?calls\s*\|\s*>|</\|dsml\|tool_calls\s*$|</\|dsmltool_?calls\s*\|?\s*$|<\|/dsmltool_?calls\s*\|?\s*$)",
-    re.IGNORECASE,
-)
-PARAM_NAME_TAG_PATTERN = re.compile(r"<param_name>\s*(.*?)\s*</param_name>", re.IGNORECASE | re.DOTALL)
-PARAM_VALUE_TAG_PATTERN = re.compile(r"<param_value>\s*(.*?)\s*</param_value>", re.IGNORECASE | re.DOTALL)
+
+# 标签本地名归一化映射：各种历史变形 → 标准名
+_TAG_ALIASES = {
+    "dsml-tool-calls": "tool_calls",
+    "dsml-toolcalls": "tool_calls",
+    "dsml-tool_call": "tool_call",
+    "dsml-toolcall": "tool_call",
+    "dsml-invoke": "invoke",
+    "dsml-parameter": "parameter",
+    "dsml-tool_result": "tool_result",
+    "dsml-toolresult": "tool_result",
+    "ml_tool_calls": "tool_calls",
+    "ml_tool_call": "tool_call",
+    "tool_calls": "tool_calls",
+    "tool_call": "tool_call",
+    "invoke": "invoke",
+    "parameter": "parameter",
+    "tool_result": "tool_result",
+}
+
+# 部分片段开头的提示，用于流式 hold（在未闭合时暂存）。
 TAG_NAME_HINTS = [
-    "<|",
-    "</|",
-    "<|DSML|",
-    "</|DSML|",
-    "<|DSML|tool_calls",
-    "</|DSML|tool_calls",
-    "<|DSML|invoke",
-    "</|DSML|invoke",
-    "<|DSML|parameter",
-    "</|DSML|parameter",
-    "<|DSML|tool_result",
-    "</|DSML|tool_result",
-    "<m",
-    "</m",
-    "<ml_",
-    "</ml_",
+    "<dsml-tool-calls",
+    "</dsml-tool-calls",
+    "<dsml-tool-call",
+    "</dsml-tool-call",
+    "<dsml-invoke",
+    "</dsml-invoke",
+    "<dsml-parameter",
+    "</dsml-parameter",
+    "<dsml-tool-result",
+    "</dsml-tool-result",
     "<ml_tool_calls",
     "</ml_tool_calls",
     "<ml_tool_call",
@@ -69,10 +59,10 @@ TAG_NAME_HINTS = [
     "</ml_tool_name",
     "<ml_parameters",
     "</ml_parameters",
-    "<ml_tool_result",
-    "</ml_tool_result",
     "<tool_calls",
     "</tool_calls",
+    "<tool_call",
+    "</tool_call",
     "<invoke",
     "</invoke",
     "<parameter",
@@ -81,59 +71,13 @@ TAG_NAME_HINTS = [
 
 
 def _local_name(tag: str) -> str:
+    """归一化标签名到标准本地名（tool_calls / tool_call / invoke / parameter / tool_result）。"""
     if "}" in tag:
         tag = tag.split("}", 1)[1]
     if ":" in tag:
         tag = tag.split(":", 1)[1]
-    return tag.lower()
-
-
-def _canonical_dsml_name(name: str) -> str:
-    normalized = name.lower().replace("_", "")
-    if normalized == "toolcalls":
-        return "tool_calls"
-    if normalized == "toolresult":
-        return "tool_result"
-    return normalized
-
-
-def _repair_malformed_dsml(block: str) -> str:
-    if "<|" not in block and "]]|>" not in block:
-        return block
-
-    repaired = block.replace("]]|>", "]]>")
-    if "<![CDATA[" in repaired:
-        repaired = re.sub(
-            r"(?<!\])\]>(?=</\|dsml\|parameter\b|</\|DSML\|parameter\b|</parameter\b|</\|dsmlparameter\|)",
-            "]]>",
-            repaired,
-            flags=re.IGNORECASE,
-        )
-
-    def replace_open(match: re.Match[str]) -> str:
-        name = _canonical_dsml_name(match.group("name"))
-        attrs = match.group("attrs").rstrip("|").rstrip()
-        return f"<|DSML|{name}{attrs}>"
-
-    def replace_close(match: re.Match[str]) -> str:
-        return f"</|DSML|{_canonical_dsml_name(match.group('name'))}>"
-
-    repaired = DSML_OPEN_TAG_PATTERN.sub(replace_open, repaired)
-    repaired = DSML_CLOSE_TAG_PATTERN.sub(replace_close, repaired)
-    repaired = DSML_COMPACT_CLOSE_TAG_PATTERN.sub(replace_close, repaired)
-    repaired = DSML_DOUBLE_PIPE_CLOSE_TAG_PATTERN.sub(replace_close, repaired)
-    repaired = re.sub(
-        r"(?:</\|dsml\|tool_calls|</\|dsmltool_?calls|<\|/dsmltool_?calls)\s*\|?\s*$",
-        "</|DSML|tool_calls>",
-        repaired,
-        flags=re.IGNORECASE,
-    )
-    return repaired
-
-
-def _normalize_dsml_to_xml(block: str) -> str:
-    repaired = _repair_malformed_dsml(block)
-    return DSML_TAG_PATTERN.sub(lambda match: match.group(0).replace("|DSML|", ""), repaired)
+    lower = tag.lower()
+    return _TAG_ALIASES.get(lower, lower)
 
 
 def _is_allowed_tool_name(tool_name: str, allowed_tool_names: set[str] | None) -> bool:
@@ -275,6 +219,11 @@ def _parse_tool_call_element(
     return _build_tool_call(tool_name, arguments, index)
 
 
+# 兜底：模型偶尔会输出 <param_name>url</param_name><param_value>...</param_value> 的非规范格式
+PARAM_NAME_TAG_PATTERN = re.compile(r"<param_name>\s*(.*?)\s*</param_name>", re.IGNORECASE | re.DOTALL)
+PARAM_VALUE_TAG_PATTERN = re.compile(r"<param_value>\s*(.*?)\s*</param_value>", re.IGNORECASE | re.DOTALL)
+
+
 def _extract_malformed_tool_call_from_root(
     root: ET.Element,
     allowed_tool_names: set[str] | None,
@@ -329,7 +278,7 @@ def _parse_xml_block(
     start_index: int,
 ) -> tuple[list[dict[str, object]], tuple[int, int] | None]:
     try:
-        root = ET.fromstring(_normalize_dsml_to_xml(block))
+        root = ET.fromstring(block)
     except ET.ParseError:
         return [], None
 
@@ -369,17 +318,17 @@ def _mask_code_fences(text: str) -> str:
     return "".join(masked)
 
 
+def _closing_pattern_for(tag: str) -> re.Pattern[str]:
+    """根据起始标签名生成对应的闭合标签正则。"""
+    return re.compile(rf"</{re.escape(tag)}\s*>", re.IGNORECASE)
+
+
 def _find_matching_block(
     masked_text: str,
     start_match: re.Match[str],
-    *,
-    allow_trailing_close: bool = False,
 ) -> tuple[int, int] | None:
     tag_name = start_match.group("tag").lower()
-    if tag_name == "|dsml|tool_calls":
-        closing_pattern = DSML_TOOL_CALLS_TRAILING_CLOSE_PATTERN if allow_trailing_close else DSML_TOOL_CALLS_CLOSE_PATTERN
-    else:
-        closing_pattern = re.compile(rf"</{re.escape(tag_name)}\s*>", re.IGNORECASE)
+    closing_pattern = _closing_pattern_for(tag_name)
     closing_match = closing_pattern.search(masked_text, start_match.end())
     if closing_match is None:
         return None
@@ -389,8 +338,6 @@ def _find_matching_block(
 def _extract_tool_blocks(
     text: str,
     allowed_tool_names: set[str] | None,
-    *,
-    allow_trailing_close: bool = False,
 ) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
     masked_text = _mask_code_fences(text)
     spans: list[tuple[int, int]] = []
@@ -401,7 +348,7 @@ def _extract_tool_blocks(
         match = START_TAG_PATTERN.search(masked_text, cursor)
         if match is None:
             break
-        span = _find_matching_block(masked_text, match, allow_trailing_close=allow_trailing_close)
+        span = _find_matching_block(masked_text, match)
         if span is None:
             break
 
@@ -414,7 +361,7 @@ def _extract_tool_blocks(
             tool_calls.extend(block_calls)
             cursor = end
             continue
-        if match.group("tag").lower() in {"|dsml|tool_calls", "tool_calls", "ml_tool_calls", "ml_tool_call"}:
+        if _local_name(match.group("tag")) in {"tool_calls", "ml_tool_calls", "tool_call", "ml_tool_call"}:
             spans.append((start, end))
             cursor = end
             continue
@@ -459,14 +406,14 @@ def _find_unmatched_fence_start(text: str) -> int | None:
     return last_open
 
 
-def _find_incomplete_block_start(text: str, *, allow_trailing_close: bool = False) -> int | None:
+def _find_incomplete_block_start(text: str) -> int | None:
     masked_text = _mask_code_fences(text)
     cursor = 0
     while cursor < len(masked_text):
         match = START_TAG_PATTERN.search(masked_text, cursor)
         if match is None:
             break
-        span = _find_matching_block(masked_text, match, allow_trailing_close=allow_trailing_close)
+        span = _find_matching_block(masked_text, match)
         if span is None:
             return match.start()
         cursor = span[1]
@@ -475,9 +422,6 @@ def _find_incomplete_block_start(text: str, *, allow_trailing_close: bool = Fals
 
 def _find_partial_tag_start(text: str) -> int | None:
     lowered_text = text.lower()
-    pipe_tag_start = lowered_text.rfind("<|")
-    if pipe_tag_start != -1 and ">" not in lowered_text[pipe_tag_start:]:
-        return pipe_tag_start
     for hint in TAG_NAME_HINTS:
         lowered_hint = hint.lower()
         max_overlap = min(len(hint), len(text))
@@ -492,7 +436,7 @@ def _looks_like_tool_markup_fragment(text: str) -> bool:
     lowered = stripped.lower()
     if not stripped:
         return False
-    if lowered.startswith("<|dsml|") or lowered.startswith("</|dsml|") or lowered.startswith("<|/dsml"):
+    if lowered.startswith("<dsml-") or lowered.startswith("</dsml-"):
         return True
     if stripped.startswith("<ml_") or stripped.startswith("</ml_"):
         return True
@@ -514,7 +458,7 @@ def _split_stream_text(
 ) -> tuple[str, str, list[dict[str, object]]]:
     hold_from_candidates = [
         index
-        for index in (_find_unmatched_fence_start(text), _find_incomplete_block_start(text, allow_trailing_close=final))
+        for index in (_find_unmatched_fence_start(text), _find_incomplete_block_start(text))
         if index is not None
     ]
 
@@ -532,7 +476,7 @@ def _split_stream_text(
 
     processable = text[:safe_end]
     remainder = text[safe_end:]
-    spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names, allow_trailing_close=final)
+    spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names)
     visible = _remove_spans(processable, spans, trim_outer_whitespace=final)
     return visible, remainder, tool_calls
 
@@ -540,7 +484,7 @@ def _split_stream_text(
 def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = None) -> tuple[str, list[dict[str, object]]]:
     if not text:
         return "", []
-    spans, tool_calls = _extract_tool_blocks(text, allowed_tool_names, allow_trailing_close=True)
+    spans, tool_calls = _extract_tool_blocks(text, allowed_tool_names)
     return _remove_spans(text, spans), tool_calls
 
 

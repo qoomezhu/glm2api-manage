@@ -4,10 +4,12 @@ from glm2api.utils.tool_parser import StreamingToolParser, parse_tool_calls_from
 def test_parse_tool_calls_from_dsml_markup():
     text = (
         "before\n"
-        "<|DSML|tool_calls><|DSML|invoke name=\"get_weather\">"
-        "<|DSML|parameter name=\"city\"><![CDATA[上海]]></|DSML|parameter>"
-        "<|DSML|parameter name=\"days\">2</|DSML|parameter>"
-        "</|DSML|invoke></|DSML|tool_calls>\n"
+        "<dsml-tool-calls>\n"
+        '  <dsml-invoke name="get_weather">\n'
+        '    <dsml-parameter name="city"><![CDATA[上海]]></dsml-parameter>\n'
+        '    <dsml-parameter name="days">2</dsml-parameter>\n'
+        "  </dsml-invoke>\n"
+        "</dsml-tool-calls>\n"
         "after"
     )
 
@@ -39,14 +41,18 @@ def test_parse_tool_calls_from_canonical_invoke_markup():
 
 def test_parse_rejects_undeclared_and_blocked_native_tools():
     blocked_text = (
-        "<|DSML|tool_calls><|DSML|invoke name=\"open_url\">"
-        "<|DSML|parameter name=\"url\">https://example.com</|DSML|parameter>"
-        "</|DSML|invoke></|DSML|tool_calls>"
+        "<dsml-tool-calls>\n"
+        '  <dsml-invoke name="open_url">\n'
+        '    <dsml-parameter name="url"><![CDATA[https://example.com]]></dsml-parameter>\n'
+        "  </dsml-invoke>\n"
+        "</dsml-tool-calls>"
     )
     undeclared_text = (
-        "<|DSML|tool_calls><|DSML|invoke name=\"not_declared\">"
-        "<|DSML|parameter name=\"value\">x</|DSML|parameter>"
-        "</|DSML|invoke></|DSML|tool_calls>"
+        "<dsml-tool-calls>\n"
+        '  <dsml-invoke name="not_declared">\n'
+        '    <dsml-parameter name="value">x</dsml-parameter>\n'
+        "  </dsml-invoke>\n"
+        "</dsml-tool-calls>"
     )
 
     clean, tool_calls = parse_tool_calls_from_text(blocked_text, {"open_url"})
@@ -61,7 +67,9 @@ def test_parse_rejects_undeclared_and_blocked_native_tools():
 def test_parse_ignores_dsml_markup_inside_code_fence():
     text = (
         "```xml\n"
-        "<|DSML|tool_calls><|DSML|invoke name=\"get_weather\"></|DSML|invoke></|DSML|tool_calls>\n"
+        "<dsml-tool-calls>\n"
+        '  <dsml-invoke name="get_weather"></dsml-invoke>\n'
+        "</dsml-tool-calls>\n"
         "```"
     )
 
@@ -75,16 +83,18 @@ def test_streaming_tool_parser_never_leaks_dsml_markup_fragments():
     parser = StreamingToolParser(allowed_tool_names={"get_weather"})
     visible_parts: list[str] = []
     payload = (
-        "<|DSML|tool_calls><|DSML|invoke name=\"get_weather\">"
-        "<|DSML|parameter name=\"city\">上海</|DSML|parameter>"
-        "</|DSML|invoke></|DSML|tool_calls>"
+        "<dsml-tool-calls>\n"
+        '  <dsml-invoke name="get_weather">\n'
+        '    <dsml-parameter name="city"><![CDATA[上海]]></dsml-parameter>\n'
+        "  </dsml-invoke>\n"
+        "</dsml-tool-calls>"
     )
 
     for char in payload:
         piece = parser.consume(char)
         visible_parts.append(piece)
-        assert "<|DSML|" not in piece
-        assert "</|DSML|" not in piece
+        assert "<dsml-" not in piece
+        assert "</dsml-" not in piece
 
     tail, tool_calls = parser.flush()
 
@@ -94,31 +104,13 @@ def test_streaming_tool_parser_never_leaks_dsml_markup_fragments():
     assert tool_calls[0]["function"]["arguments"] == '{"city":"上海"}'
 
 
-def test_parse_tool_calls_from_glm_malformed_dsml_markup():
+def test_parse_tool_calls_parses_json_array_cdata():
     text = (
-        '<|dsml|tool_calls|><|dsml|invoke name="shell"|>'
-        '<|dsml|parameter name="command"><![CDATA["powershell.exe", "-Command", '
-        '"Get-ChildItem -Force | Select-Object Name, Mode, Length"]]|>\n'
-        '</|dsMLparameter|><|dsml|parameter name="workdir"><![CDATA[E:\\Projects\\2api\\glm2api]]>'
-        '</|dsmlparameter|><|/dsmlinvoke|></|dsmltoolcalls|>'
-    )
-
-    clean, tool_calls = parse_tool_calls_from_text(text, {"shell"})
-
-    assert clean == ""
-    assert len(tool_calls) == 1
-    assert tool_calls[0]["function"]["name"] == "shell"
-    assert tool_calls[0]["function"]["arguments"] == (
-        '{"command":"\\"powershell.exe\\", \\"-Command\\", '
-        '\\"Get-ChildItem -Force | Select-Object Name, Mode, Length\\"","workdir":"E:\\\\Projects\\\\2api\\\\glm2api"}'
-    )
-
-
-def test_parse_tool_calls_repairs_json_array_at_cdata_boundary():
-    text = (
-        '<|DSML|tool_calls><|DSML|invoke name="shell">'
-        '<|DSML|parameter name="command"><![CDATA[["powershell.exe", "-Command", "pwd"]]></|DSML|parameter>'
-        '</|DSML|invoke></|DSML|tool_calls>'
+        "<dsml-tool-calls>\n"
+        '  <dsml-invoke name="shell">\n'
+        '    <dsml-parameter name="command"><![CDATA[["powershell.exe", "-Command", "pwd"]]]></dsml-parameter>\n'
+        "  </dsml-invoke>\n"
+        "</dsml-tool-calls>"
     )
 
     clean, tool_calls = parse_tool_calls_from_text(text, {"shell"})
@@ -126,66 +118,6 @@ def test_parse_tool_calls_repairs_json_array_at_cdata_boundary():
     assert clean == ""
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["arguments"] == '{"command":["powershell.exe","-Command","pwd"]}'
-
-
-def test_parse_tool_calls_repairs_missing_final_dsml_close_angle():
-    text = (
-        '<|DSML|tool_calls><|DSML|invoke name="shell">'
-        '<|DSML|parameter name="command"><![CDATA[["powershell.exe", "-Command", "pwd"]]></|DSML|parameter>'
-        '</|DSML|invoke></|DSML|tool_calls'
-    )
-
-    clean, tool_calls = parse_tool_calls_from_text(text, {"shell"})
-
-    assert clean == ""
-    assert len(tool_calls) == 1
-    assert tool_calls[0]["function"]["arguments"] == '{"command":["powershell.exe","-Command","pwd"]}'
-
-
-def test_parse_tool_calls_repairs_double_pipe_dsml_close_tag():
-    text = (
-        '<|DSML|tool_calls><|DSML|invoke name="shell">'
-        '<|DSML|parameter name="command"><![CDATA[["powershell.exe", "-Command", "pwd"]]]></|DSML|parameter>'
-        '<||DSML|invoke></|DSML|tool_calls>'
-    )
-
-    clean, tool_calls = parse_tool_calls_from_text(text, {"shell"})
-
-    assert clean == ""
-    assert len(tool_calls) == 1
-    assert tool_calls[0]["function"]["arguments"] == '{"command":["powershell.exe","-Command","pwd"]}'
-
-
-def test_parse_tool_calls_repairs_single_bracket_cdata_close():
-    text = (
-        '<|DSML|tool_calls><|DSML|invoke name="search">'
-        '<|DSML|parameter name="search_query"><![CDATA[{"q":"阿房宫赋","recency":365}]></|DSML|parameter>'
-        '</|DSML|invoke></|DSML|tool_calls>'
-    )
-
-    clean, tool_calls = parse_tool_calls_from_text(text, None)
-
-    assert clean == ""
-    assert len(tool_calls) == 1
-    assert tool_calls[0]["function"]["name"] == "search"
-    assert tool_calls[0]["function"]["arguments"] == '{"search_query":{"q":"阿房宫赋","recency":365}}'
-
-
-def test_streaming_tool_parser_hides_glm_malformed_dsml_until_flush():
-    parser = StreamingToolParser(allowed_tool_names={"shell"})
-    payload = (
-        '<|dsml|tool_calls|><|dsml|invoke name="shell"|>'
-        '<|dsml|parameter name="command"><![CDATA[pwd]]|></|dsMLparameter|>'
-        '<|/dsmlinvoke|></|dsmltoolcalls|>'
-    )
-
-    visible_parts = [parser.consume(char) for char in payload]
-    tail, tool_calls = parser.flush()
-
-    assert "".join(visible_parts) == ""
-    assert tail == ""
-    assert len(tool_calls) == 1
-    assert tool_calls[0]["function"]["arguments"] == '{"command":"pwd"}'
 
 
 def test_parse_tool_calls_from_xml_markup():
@@ -270,8 +202,9 @@ def test_streaming_tool_parser_never_leaks_ml_markup_fragments():
 
 
 def test_parse_rejects_legacy_or_noncanonical_tool_markup():
+    # 这些格式不在 START_TAG_PATTERN 支持范围内，应原样保留不解析。
+    # 注意：<tool_call> 现在已是受支持的标签名，不再属于"非规范"格式。
     legacy_variants = [
-        '<tool_call>{"tool":"Bash","params":{"command":"pwd"}}</tool_call>',
         "<function_call>Bash</function_call>",
         '<invoke name="Bash"><parameters><command>pwd</command></parameters></invoke>',
         '<tool_use><function name="Bash"><parameter name="command">pwd</parameter></function></tool_use>',

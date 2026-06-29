@@ -5,9 +5,9 @@ import codecs
 import gzip
 import http.client
 import json
-import socket
 import mimetypes
 import re
+import socket
 import threading
 import time
 import uuid
@@ -21,7 +21,7 @@ from logging import Logger
 from typing import Callable
 
 from ..config import AppConfig
-from ..logging_utils import debug_dump
+from ..logging_utils import debug_dump, mask_sensitive_headers
 from .glm_auth import GLMAccessTokenManager, build_sign
 from .translator import (
     BLOCKED_NATIVE_TOOL_NAMES,
@@ -38,10 +38,6 @@ from .translator import (
 
 FILE_UPLOAD_URL_SUFFIX = "/backend-api/assistant/file_upload"
 FILE_SIZE_LIMIT = 100 * 1024 * 1024
-# Sentinel: yielded by _iter_sse_events when upstream has no data for a while,
-# so generate() can send an SSE keepalive comment to the client.
-_KEEPALIVE = object()
-KEEPALIVE_INTERVAL = 30  # seconds
 IMAGE_SIZE_TO_ASPECT_RATIO = {
     "1024x1024": "1:1",
     "1024x1536": "2:3",
@@ -231,9 +227,6 @@ class GLMWebClient:
         def generate():
             try:
                 for event in self._iter_sse_events(response):
-                    if event is _KEEPALIVE:
-                        yield b": keepalive\n\n"
-                        continue
                     if not event:
                         continue
                     self._raise_for_event_error(event, stream=True)
@@ -350,7 +343,7 @@ class GLMWebClient:
                         **self.auth.get_browser_headers(),
                         "Authorization": f"Bearer {access_token}",
                         "Referer": "https://chatglm.cn/main/alltoolsdetail",
-                        "X-Device-Id": uuid.uuid4().hex,
+                        "X-Device-Id": self.auth.get_device_id(account_index),
                         "X-Nonce": nonce,
                         "X-Request-Id": uuid.uuid4().hex,
                         "X-Sign": sign,
@@ -454,7 +447,7 @@ class GLMWebClient:
                         headers={
                             **self.auth.get_browser_headers(),
                             "Authorization": f"Bearer {access_token}",
-                            "X-Device-Id": uuid.uuid4().hex,
+                            "X-Device-Id": self.auth.get_device_id(account_index),
                             "X-Nonce": nonce,
                             "X-Request-Id": uuid.uuid4().hex,
                             "X-Sign": sign,
@@ -465,7 +458,7 @@ class GLMWebClient:
                         self.logger,
                         self.config.debug_dump_all,
                         f"转发到 GLM 的 chat 请求头 account={account_index} attempt={attempt + 1}",
-                        dict(request.header_items()),
+                        mask_sensitive_headers(dict(request.header_items())),
                     )
                     return self._prepare_chat_response(
                         urllib.request.urlopen(request, timeout=self.config.request_timeout)
@@ -557,7 +550,7 @@ class GLMWebClient:
                 headers={
                     **self.auth.get_browser_headers(),
                     "Authorization": f"Bearer {access_token}",
-                    "X-Device-Id": uuid.uuid4().hex,
+                    "X-Device-Id": self.auth.get_device_id(account_index),
                     "X-Nonce": nonce,
                     "X-Request-Id": uuid.uuid4().hex,
                     "X-Sign": sign,
@@ -568,7 +561,7 @@ class GLMWebClient:
                 self.logger,
                 self.config.debug_dump_all,
                 f"转发到 GLM 的 image 请求头 account={account_index}",
-                dict(request.header_items()),
+                mask_sensitive_headers(dict(request.header_items())),
             )
             try:
                 return self._prepare_chat_response(urllib.request.urlopen(request, timeout=self.config.request_timeout))
@@ -721,75 +714,41 @@ class GLMWebClient:
                 self.logger.debug("忽略无法解析的 SSE 片段: %s", payload)
                 return None
 
-        # Set a shorter socket timeout so we can send keepalive comments
-        # to the client while waiting for the upstream to respond.
-        # This prevents front-end idle-timeout errors (e.g. Open WebUI 45s).
-        #
-        # Access the underlying raw socket through the response chain:
-        #   addinfourl -> HTTPResponse -> BufferedReader -> SocketIO -> socket
-        # The urllib.response.addinfourl object's .fp is the HTTPResponse,
-        # which has .fp = sock.makefile("rb") — a BufferedReader wrapping SocketIO.
-        sock = None
-        try:
-            # Non-gzip: addinfourl.fp is HTTPResponse, HTTPResponse.fp is BufferedReader
-            if hasattr(response, "fp") and hasattr(response.fp, "fp"):
-                inner = response.fp.fp
-                if hasattr(inner, "raw") and hasattr(inner.raw, "_sock"):
-                    sock = inner.raw._sock
-                elif hasattr(inner, "_sock"):
-                    sock = inner._sock
-            # Gzip: response is BufferedReader(GzipFile(fileobj=urllib_response))
-            elif hasattr(response, "raw") and hasattr(response.raw, "fileobj"):
-                fileobj = response.raw.fileobj
-                if hasattr(fileobj, "fp") and hasattr(fileobj.fp, "fp"):
-                    inner = fileobj.fp.fp
-                    if hasattr(inner, "raw") and hasattr(inner.raw, "_sock"):
-                        sock = inner.raw._sock
-                    elif hasattr(inner, "_sock"):
-                        sock = inner._sock
-        except (AttributeError, TypeError, OSError):
-            sock = None
-
-        original_timeout = None
-        if sock is not None and hasattr(sock, "settimeout"):
+        # Keepalive is handled at the server layer (see _stream_completion in
+        # server.py) via a queue-based heartbeat. _iter_sse_events only needs to
+        # block on upstream reads until data is available or the connection
+        # closes; no socket-level timeout manipulation is required here.
+        while True:
+            stop_after_chunk = False
             try:
-                original_timeout = sock.gettimeout()
-                sock.settimeout(KEEPALIVE_INTERVAL)
-            except OSError:
-                pass
+                raw_chunk = response.read(4096)
+            except socket.timeout:
+                # Upstream read idle for request_timeout seconds. The server
+                # layer emits keepalive comments to the client independently
+                # (see _stream_completion in server.py), so we just keep
+                # waiting for the next chunk rather than treating this as
+                # fatal. This allows long "thinking" pauses to succeed.
+                self.logger.debug("上游 SSE 读取空闲超时，继续等待")
+                continue
+            except http.client.IncompleteRead as exc:
+                raw_chunk = exc.partial or b""
+                stop_after_chunk = True
+                self.logger.warning("上游 SSE 连接提前断开，按已接收内容收尾 bytes=%s", len(raw_chunk))
+            if not raw_chunk:
+                break
 
-        try:
-            while True:
-                stop_after_chunk = False
-                try:
-                    raw_chunk = response.read(4096)
-                except socket.timeout:
-                    self.logger.debug("上游 SSE 读取超时（keepalive），继续等待")
-                    yield _KEEPALIVE
-                    continue
-                except http.client.IncompleteRead as exc:
-                    raw_chunk = exc.partial or b""
-                    stop_after_chunk = True
-                    self.logger.warning("上游 SSE 连接提前断开，按已接收内容收尾 bytes=%s", len(raw_chunk))
-                if not raw_chunk:
-                    break
+            pending += decoder.decode(raw_chunk, False).replace("\r\n", "\n")
 
-                pending += decoder.decode(raw_chunk, False).replace("\r\n", "\n")
+            while "\n\n" in pending:
+                block, pending = pending.split("\n\n", 1)
+                event = emit_block(block.strip())
+                if event == "[DONE]":
+                    return
+                if event is not None:
+                    yield event
 
-                while "\n\n" in pending:
-                    block, pending = pending.split("\n\n", 1)
-                    event = emit_block(block.strip())
-                    if event == "[DONE]":
-                        return
-                    if event is not None:
-                        yield event
-
-                if stop_after_chunk:
-                    break
-        finally:
-            # Restore original socket timeout
-            if sock is not None and hasattr(sock, "settimeout") and original_timeout is not None:
-                sock.settimeout(original_timeout)
+            if stop_after_chunk:
+                break
 
         remaining = decoder.decode(b"", True)
         if remaining:
@@ -850,7 +809,7 @@ class GLMWebClient:
                         "Authorization": f"Bearer {access_token}",
                         "Content-Type": f"multipart/form-data; boundary={boundary}",
                         "Referer": "https://chatglm.cn/",
-                        "X-Device-Id": uuid.uuid4().hex,
+                        "X-Device-Id": self.auth.get_device_id(account_index),
                         "X-Nonce": nonce,
                         "X-Request-Id": uuid.uuid4().hex,
                         "X-Sign": sign,
@@ -861,7 +820,7 @@ class GLMWebClient:
                     self.logger,
                     self.config.debug_dump_all,
                     f"转发到 GLM 的 file_upload 请求头 account={account_index}",
-                    dict(request.header_items()),
+                    mask_sensitive_headers(dict(request.header_items())),
                 )
                 debug_dump(
                     self.logger,

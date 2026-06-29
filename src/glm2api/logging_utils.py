@@ -264,3 +264,37 @@ def debug_dump(logger: logging.Logger, enabled: bool, title: str, value: Any) ->
     if not enabled:
         return
     logger.debug("%s\n%s", title, serialize_for_debug(value))
+
+
+# Header names (lowercased) whose values must never appear in debug logs.
+# Matches anything containing token / key / secret / auth / cookie / sign.
+_SENSITIVE_HEADER_HINTS = ("token", "key", "secret", "auth", "cookie", "sign")
+
+
+def mask_sensitive_headers(headers: Any) -> Any:
+    """Return a copy of ``headers`` with sensitive values masked.
+
+    Accepts a dict (header name -> value) or a list of (name, value) pairs.
+    Non-sensitive entries are passed through unchanged so the rest of the
+    header dump remains useful for debugging.
+    """
+    if isinstance(headers, dict):
+        masked: dict[str, object] = {}
+        for name, value in headers.items():
+            lname = str(name).lower()
+            if any(hint in lname for hint in _SENSITIVE_HEADER_HINTS):
+                masked[name] = "***"
+            else:
+                masked[name] = value
+        return masked
+    if isinstance(headers, (list, tuple)):
+        result: list[object] = []
+        for item in headers:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                name, value = item  # type: ignore[misc]
+                lname = str(name).lower()
+                result.append([name, "***"] if any(hint in lname for hint in _SENSITIVE_HEADER_HINTS) else [name, value])
+            else:
+                result.append(item)
+        return result
+    return headers

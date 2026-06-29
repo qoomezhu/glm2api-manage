@@ -14,6 +14,9 @@ DEFAULT_IMAGE_MODEL_NAME = "glm-image-1"
 DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
 GUEST_REFRESH_TOKEN_MARKER = "__glm_guest__"
 DEFAULT_BLOCKED_TOOL_NAMES = ()
+# GLM 网页端请求签名密钥。优先从环境变量 GLM_SIGN_SECRET 读取，
+# 未设置时回退到内置默认值。允许运维在不动源码的前提下更换密钥。
+DEFAULT_SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
 BUILTIN_EXPOSED_MODELS = (
     "cogView-4-250304",
     "glm-5.2",
@@ -158,6 +161,7 @@ class AppConfig:
     server_api_keys: list[str]
     admin_key: str
     cors_allow_origin: str
+    glm_sign_secret: str
 
     @property
     def refresh_url(self) -> str:
@@ -280,6 +284,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         server_api_keys=parse_list(values.get("SERVER_API_KEYS")),
         admin_key=values.get("ADMIN_KEY", "glm2api-admin").strip() or "glm2api-admin",
         cors_allow_origin=values.get("CORS_ALLOW_ORIGIN", "*").strip() or "*",
+        glm_sign_secret=(values.get("GLM_SIGN_SECRET") or DEFAULT_SIGN_SECRET).strip(),
     )
 
     if not (1 <= config.port <= 65535):

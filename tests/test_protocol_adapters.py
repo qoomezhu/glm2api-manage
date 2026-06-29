@@ -16,18 +16,18 @@ class _DummyConfig:
     glm_user_agent = "Mozilla/5.0"
 
 
-def test_get_browser_headers_includes_random_x_forwarded_for():
+def test_get_browser_headers_has_consistent_app_fr_with_origin():
     manager = GLMAccessTokenManager.__new__(GLMAccessTokenManager)
     manager.config = _DummyConfig()
 
     headers = manager.get_browser_headers()
-    xff = headers["X-Forwarded-For"]
-    octets = xff.split(".")
 
-    assert len(octets) == 4
-    assert all(part.isdigit() for part in octets)
-    assert 1 <= int(octets[0]) <= 223
-    assert int(octets[0]) not in {10, 127, 169, 172, 192}
+    # X-Forwarded-For 伪造头应已移除（与 chatglm.cn 同源伪装矛盾）
+    assert "X-Forwarded-For" not in headers
+    # X-App-Fr 应与 Origin: chatglm.cn 一致，表示网页端而非浏览器扩展
+    assert headers["X-App-Fr"] == "web"
+    assert headers["Origin"] == "https://chatglm.cn"
+    assert headers["Sec-Fetch-Site"] == "same-origin"
 
 
 def test_responses_to_openai_preserves_tool_choice():

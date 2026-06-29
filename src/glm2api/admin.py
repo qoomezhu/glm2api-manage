@@ -59,10 +59,13 @@ class ApiKeyStore:
     def validate(self, raw_key: str) -> bool:
         if not raw_key:
             return False
+        # 恒定时间比较，防止通过响应耗时差异枚举 API key（时序侧信道）。
+        # 即使 key 长度不同也先 compare_digest 一次，避免提前短路泄漏长度信息。
+        matched = False
         for rec in self._keys.values():
-            if rec.enabled and rec.key == raw_key:
-                return True
-        return False
+            if rec.enabled and hmac.compare_digest(rec.key, raw_key):
+                matched = True
+        return matched
 
     def list_all(self) -> list[dict[str, object]]:
         return [r.to_dict(mask=True) for r in self._keys.values()]
